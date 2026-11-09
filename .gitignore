@@ -1,0 +1,8 @@
+.venv/
+bundle/
+js/node_modules/
+example/node_modules/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+MUJOCO_LOG.TXT
