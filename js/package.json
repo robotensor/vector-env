@@ -1,0 +1,24 @@
+{
+  "name": "@vector/env",
+  "version": "0.1.0",
+  "description": "The simulator side of vector-env: scene settling, replay and the vector-expert/2 step coordinator",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./*": "./src/*"
+  },
+  "bin": {
+    "vector-env-sim": "./bin/sim.mjs",
+    "vector-env-harness": "./bin/harness.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@vector/sim": "file:../../vector-sim/js"
+  },
+  "license": "Apache-2.0"
+}
