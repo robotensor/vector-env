@@ -1,0 +1,11 @@
+materials:
+  stainless_steel:   {density: 7.88, friction: 0.62}
+  galvanized_steel:  {density: 7.90, friction: 0.57}
+  black_oxide_steel: {density: 7.90, friction: 0.55}
+  painted_steel:     {density: 7.90, friction: 0.62}
+  cast_iron:         {density: 7.15, friction: 0.55}
+  aluminum:          {density: 2.73, friction: 0.68}
+  brass:             {density: 8.57, friction: 0.60}
+  bronze:            {density: 8.15, friction: 0.60}
+  hard_plastic:      {density: 1.18, friction: 0.50}
+  rubber:            {density: 1.20, friction: 1.00}
