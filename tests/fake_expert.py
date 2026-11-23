@@ -8,6 +8,10 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "hold"
 per = int(sys.argv[2]) if len(sys.argv) > 2 and mode != "sleep" else 1
 q = None
 asked = False
+if mode == "noisy":
+    sys.stderr.write("noisy expert says hi\n")
+    sys.stderr.flush()
+    mode = "empty"
 
 
 def send(o):

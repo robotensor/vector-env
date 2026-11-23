@@ -4,6 +4,7 @@ import { CTRL, b64ToF64 } from '@vector/sim';
 import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, round } from './env.js';
 
 const STDERR_TAIL = 2000;
+const STDERR_FILE_MAX = 16 << 20;
 export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed'];
 const IO = { max_line_kib: 1024, max_queued: 4, max_read_mib: 64, max_unread_mib: 16 };
 
@@ -15,7 +16,7 @@ function ioLimits(io) {
 }
 
 class Expert {
-  constructor(argv, env, cwd, io) {
+  constructor(argv, env, cwd, io, stderrFile) {
     this.lim = ioLimits(io);
     this.lines = [];
     this.waiter = null;
@@ -28,7 +29,19 @@ class Expert {
     this.p = spawn(argv[0], argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], cwd: cwd || process.cwd(), env: { ...process.env, ...(env || {}) } });
     this.p.stdout.on('data', (b) => this._data(b));
     this.p.stderr.setEncoding('utf8');
-    this.p.stderr.on('data', (s) => { this.stderr = (this.stderr + s).slice(-STDERR_TAIL); });
+    this.log = null;
+    this.logged = 0;
+    if (stderrFile) {
+      try {
+        this.log = fs.createWriteStream(stderrFile, { flags: 'a' });
+        this.log.on('error', () => { this.log = null; });
+      } catch { this.log = null; }
+    }
+    this.p.stderr.on('data', (s) => {
+      this.stderr = (this.stderr + s).slice(-STDERR_TAIL);
+      if (this.log && this.logged < STDERR_FILE_MAX) { this.log.write(s.slice(0, STDERR_FILE_MAX - this.logged)); this.logged += s.length; }
+    });
+    this.p.stderr.on('close', () => { if (this.log) { this.log.end(); this.log = null; } });
     this.p.stdin.on('error', () => {});
     this.spawned = false;
     this.spawnError = null;
@@ -167,7 +180,7 @@ export async function runJob(cells, job) {
                   checkpoint: sc.checkpoint, state_hash: sc.state_hash, target: sc.target,
                   tick: 0, t: 0, ...physState(cell), obs: observation(cell, { rgb: job.rgb !== false }), limits: lim };
   res.setup_s = round((performance.now() - t0) / 1000, 3);
-  const ex = new Expert(job.expert.argv, job.expert.env, job.expert.cwd, job.io);
+  const ex = new Expert(job.expert.argv, job.expert.env, job.expert.cwd, job.io, job.expert.stderr_file);
   let timedOut = false;
   const wallMs = Math.max(0, 1000 * wallS - (performance.now() - t0));
   let timer;

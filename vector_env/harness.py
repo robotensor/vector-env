@@ -40,6 +40,10 @@ class ImageTooLarge(HarnessError):
     outcome = "image_too_large"
 
 
+class ReplayMismatch(HarnessError):
+    outcome = "replay_mismatch"
+
+
 def docker_defaults() -> dict:
     return dict(env_config()["harness"]["docker"])
 
@@ -209,19 +213,28 @@ def prepare(expert: dict, docker: dict | None = None, pull_missing: bool = False
     return None
 
 
-def _expert_spec(expert: dict, docker: dict | None, bundle: Path, cids: str | None = None) -> dict:
+def _expert_spec(expert: dict, docker: dict | None, bundle: Path, cids: str | None = None,
+                 stderr_file: str | None = None) -> dict:
     if expert.get("command"):
         cmd = expert["command"]
         argv = shlex.split(cmd) if isinstance(cmd, str) else [str(x) for x in cmd]
-        return {"argv": argv, "kill": None, "cwd": str(expert.get("cwd") or Path.cwd()),
+        spec = {"argv": argv, "kill": None, "cwd": str(expert.get("cwd") or Path.cwd()),
                 "env": {"VECTOR_SIM_BUNDLE": str(bundle), **(expert.get("env") or {})}}
-    if expert.get("image"):
+    elif expert.get("image"):
         name = f"vector-env-{uuid.uuid4().hex[:12]}"
         cid = Path(cids) / f"{name}.cid" if cids else None
         argv, kill = docker_argv(expert["image"], name, docker, bundle, cid)
-        return {"argv": argv, "kill": kill, "cwd": str(Path.cwd()), "env": {}, "docker": True,
+        spec = {"argv": argv, "kill": kill, "cwd": str(Path.cwd()), "env": {}, "docker": True,
                 "cidfile": str(cid) if cid else None}
-    raise ValueError("expert needs an image or a command")
+    else:
+        raise ValueError("expert needs an image or a command")
+    if stderr_file:
+        spec["stderr_file"] = str(stderr_file)
+    return spec
+
+
+def stderr_path(stderr_dir: str | Path, index: int, scene: dict) -> Path:
+    return Path(stderr_dir) / f"{index:04d}-{scene.get('scene_id') or 'scene'}.log"
 
 
 def _wire(scene: dict) -> dict:
@@ -234,7 +247,8 @@ def _fail(scene: dict, outcome: str, error: str, wall: float) -> dict:
 
 
 def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
-        docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False) -> list[dict]:
+        docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
+        stderr_dir: str | Path | None = None) -> list[dict]:
     bad = prepare(expert, docker, pull)
     if bad is not None:
         out = [_fail(sc, bad[0], bad[1], 0.0) for sc in scenes]
@@ -243,17 +257,20 @@ def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float,
                 on_result(i, r)
         return out
     bundle = assets.ensure()
+    if stderr_dir:
+        Path(stderr_dir).mkdir(parents=True, exist_ok=True)
     cids = tempfile.mkdtemp(prefix="vector-env-cid-") if expert.get("image") and not expert.get("command") else None
     try:
         return _run(expert, scenes, bundle, cids, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers,
-                    docker=docker, io=io, on_result=on_result)
+                    docker=docker, io=io, on_result=on_result, stderr_dir=stderr_dir)
     finally:
         if cids:
             shutil.rmtree(cids, ignore_errors=True)
 
 
 def _run(expert: dict, scenes: list[dict], bundle: Path, cids: str | None, *, time_limit_s: float, wall_s: float,
-         workers: int, docker: dict | None, io: dict | None, on_result) -> list[dict]:
+         workers: int, docker: dict | None, io: dict | None, on_result,
+         stderr_dir: str | Path | None = None) -> list[dict]:
     H = env_config()["harness"]
     grace = float(H.get("grace_s", 2.0))
     io = {**(H.get("io") or {}), **(io or {})}
@@ -273,7 +290,8 @@ def _run(expert: dict, scenes: list[dict], bundle: Path, cids: str | None, *, ti
                     return
                 sc = scenes[i]
                 t0 = time.monotonic()
-                spec = _expert_spec(expert, docker, bundle, cids)
+                spec = _expert_spec(expert, docker, bundle, cids,
+                                    stderr_path(stderr_dir, i, sc) if stderr_dir else None)
                 job = {"id": i, "scene": _wire(sc), "expert": spec, "time_limit_s": float(time_limit_s),
                        "wall_s": float(wall_s), "grace_s": grace, "io": io}
                 try:
@@ -303,7 +321,17 @@ def _run(expert: dict, scenes: list[dict], bundle: Path, cids: str | None, *, ti
     return [r if r is not None else _fail(scenes[i], "harness_error", "not run", 0.0) for i, r in enumerate(out)]
 
 
-def replay(scene: dict, ctrl_b64: str, n: int, *, time_limit_s: float) -> dict:
+def check_replay(scene: dict, result: dict) -> None:
+    for k in ("scene_id", "state_hash"):
+        got, want = result.get(k), scene.get(k)
+        if got is not None and want is not None and got != want:
+            raise ReplayMismatch(f"the result is from scene {result.get('scene_id') or got}, not {scene.get('scene_id')} "
+                                 f"({k} differs): replay it on its own scene")
+
+
+def replay(scene: dict, ctrl_b64: str, n: int, *, time_limit_s: float, result: dict | None = None) -> dict:
+    if result is not None:
+        check_replay(scene, result)
     r = sim(assets.ensure()).call({"op": "replay", "scene": _wire(scene), "ctrl": ctrl_b64, "n": int(n),
                                    "time_limit_s": float(time_limit_s)})
     r.pop("id", None)

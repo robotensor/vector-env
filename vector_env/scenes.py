@@ -89,5 +89,29 @@ def seed_for(seed: int, index: int, salt: str = "") -> int:
     return int.from_bytes(hashlib.sha256(f"{salt}:{int(seed)}:{int(index)}".encode()).digest()[:6], "big")
 
 
+SEED_TRIES = 6
+
+
+def draw_scene(seed0: int, draw: dict | None = None, *, tries: int = SEED_TRIES, generate_fn=None,
+               on_error=None) -> tuple[dict | None, Exception | None]:
+    gen = generate_fn or generate
+    err = None
+    for k in range(int(tries)):
+        try:
+            return gen(int(seed0) + k, draw), None
+        except assets.AssetsError:
+            raise
+        except Exception as e:
+            err = e
+            if on_error:
+                on_error(k, e)
+    return None, err
+
+
+def draw_index(seed: int, index: int, draw: dict | None = None, *, salt: str = "", tries: int = SEED_TRIES,
+               generate_fn=None, on_error=None) -> tuple[dict | None, Exception | None]:
+    return draw_scene(seed_for(seed, index, salt), draw, tries=tries, generate_fn=generate_fn, on_error=on_error)
+
+
 def _wire(scene: dict) -> dict:
     return {k: scene.get(k) for k in ("scene_id", "xml", "meta", "checkpoint", "state_hash", "target")}
