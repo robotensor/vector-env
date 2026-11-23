@@ -15,6 +15,7 @@ flowchart LR
   H --> R["per-scene results + action_hash"]
   R --> P["harness.replay()"]
   R --> K["harness.compare(a, b)"]
+  R --> VF["verifier.verify: a person's or an expert's rows"]
 ```
 
 ## Setup
@@ -174,6 +175,7 @@ class Channel:
 
 res = await harness.arun({"remote": Channel()}, scene_list, time_limit_s=15, wall_s=45, workers=8,
                          step_deadline_s=2.0, first_step_deadline_s=10.0, max_restarts=2,
+                         restarts_used=None,                                  # restarts per scene so far
                          on_result=cb)                                        # cb(i, r), plain or async
 res = harness.run({"remote": Channel()}, scene_list, ...)                      # no event loop running here
 res = harness.run({"remote": Channel(), "loop": loop}, scene_list, ...)        # from a thread; loop owns the channel
@@ -189,7 +191,16 @@ waits, and the scene's wall budget (`wall_s`, counted from the scene's setup) ca
 waits until the channel is back, then gets a fresh deadline, so a reconnect (`Reconnected`) restarts it and a close
 (`ChannelClosed`) ends it `disconnected`, never `step_timeout`. On `Reconnected` every scene in flight starts
 again from tick 0 with a new key, at most `max_restarts` times (`harness.remote.max_restarts`, 2); results carry
-`scene_key` and `restarts`. Any other exception from the channel is `harness_error`.
+`scene_key` and `restarts`. `restarts_used` (one number per scene) continues the count of an earlier call: the
+scene's first key is `"<index>.<restarts_used[i]>"` and it has only the rest of `max_restarts`. Any other exception
+from the channel is `harness_error`.
+
+Every act is checked in Python before the simulator sees it (`harness.act_error(msg)`): `rows` must be a list of
+rows of 7 numbers (not `true`/`false`), each finite and within ±`harness.remote.max_abs` (100). A channel may also
+hand over `{"type":"invalid","scene_key","error"}` for an act it refused itself. A bad act, or any failure while the
+simulator applies an act, ends that scene as `expert_error`; only the simulator's `open` and `stop`, or its
+process dying (`vector_env.node.SimCrashed`), are `harness_error`. Python writes JSON to the simulator with
+`allow_nan=False`, so a NaN never reaches it.
 
 `harness.compare(results_a, results_b)` pairs the results by `scene_id` (by position when ids are missing or
 repeated) and returns `{compared, equal, all_equal, mismatched, infra, only_a, only_b, scenes: [{scene_id, equal,
@@ -201,6 +212,44 @@ For images: `harness.run(..., pull=True)` pulls a missing image first; `harness.
 `harness.pull(image)` (always pulls, raising `PullFailed`, `ImageTooLarge` or `DockerUnavailable`, all
 `HarnessError` with an `outcome`), `harness.image_size(image)` (bytes on this machine, `None` when absent),
 `harness.manifest_size(image)` and `harness.remove_image(image)` (to prune after a round) are there for callers.
+
+## Replay verifier
+
+`vector_env.verifier` (Python) and `js/src/verifier.js` (`js/bin/verifier.mjs`, the process Python talks to) replay a
+list of rows on a scene and check what a log claims. The same check serves a person's log from the Teleop console and
+an expert's rows: the simulator, rules and hashes are the ones the harness uses.
+
+```python
+from vector_env import verifier
+
+r = verifier.verify(scene, rows, time_limit_s=30, claim={"outcome": "success", "tick": 112, "state_hash": "…",
+                                                         "marks": [[5, "…"], [10, "…"]]})
+r["ok"], r["reason"], r["outcome"], r["tick"], r["t"], r["state_hash"], r["action_hash"], r["divergence"]
+verifier.verify_result(scene, result, time_limit_s=15)   # an expert's result: its ctrl, the last row held to the verdict
+verifier.probe(scene)                                     # 40 fixed ticks from the checkpoint, a hash every 5: the self-test
+verifier.pin()                                            # {sim, code, mujoco, wasm} of the simulator in use
+verifier.rows_hash(rows), verifier.chain_seed(nonce, session, scene_id), verifier.chain_next(prev, k, a, b, sh, rows)
+```
+
+- `rows`: base64 of float64 rows, raw bytes, or a list of `[q1..q6, grip]`; whole and finite (else `malformed`).
+- A person's log (`hold=False`, the default) must end exactly at the rules' verdict: `no_verdict` when it does not
+  reach one, `rows_after_verdict` when it goes on. An expert's (`hold=True`) holds its last row until the verdict, as
+  the harness does. More rows than `time_limit_s` allows is `over_budget`.
+- `claim` (optional): `marks` (`[tick, state hash]` pairs checked as the replay passes them: the first that differs is
+  `state_mismatch` with `divergence.tick`), `outcome`, `tick`, `state_hash` (final), `action_hash`. A scene whose
+  checkpoint does not restore to its `state_hash` is `scene_error`.
+- `VECTOR_ENV_VERIFIERS` (default 1) Node processes serve the calls; each keeps `VECTOR_ENV_VERIFY_CELLS` (3) compiled
+  scenes.
+
+```mermaid
+flowchart LR
+  L["rows + claim"] --> V["verifier.verify"]
+  S["scene"] --> V
+  V --> R["restore checkpoint = state_hash"] --> P["replay with the rules (try_s = time_limit_s)"]
+  P --> M{"marks, verdict tick, final hash, action hash = claim"}
+  M -->|"yes"| OK["ok: outcome, t, state_hash, action_hash"]
+  M -->|"no"| NO["reason, divergence"]
+```
 
 ## Outcomes
 
@@ -260,7 +309,8 @@ One JSON object per line on the expert's stdin and stdout.
 - Remote experts get the same messages with a `"scene_key"` field and answer with it (`{"type":"act","scene_key",
   "rows"}`, `{"type":"error","scene_key","error"}`). Scenes ended by the harness (`step_timeout`, `wall_timeout`,
   `expert_error`) still get `{"type":"end","scene_key","outcome","t","tick","error"}`. At most 4 messages of one
-  scene may wait unanswered.
+  scene may wait unanswered. Row values must be finite JSON numbers within ±100: `NaN`, `Infinity`, `1e999`, strings
+  or booleans end the scene as `expert_error`.
 - **Determinism is required.** The same scene and the same messages must give the same rows, every run, on any
   machine: seed any randomness from the scene (`scene_id`, `checkpoint`), no clocks, no threads racing on results.
   Runs of one expert are checked against each other with the action hash.
