@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Cells, cellKey, settle, restore, replayCtrl, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES } from '../src/index.js';
+import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
@@ -101,4 +101,38 @@ test('start failures are infrastructure, a container exit is the expert\'s', { s
   const held = await runJob(cells, { scene: sc, expert: fake('hold'), time_limit_s: 1, wall_s: 10 });
   assert.equal(held.infra, false);
   assert.ok(INFRA_OUTCOMES.includes('scene_error') && !INFRA_OUTCOMES.includes('expert_error'));
+});
+
+test('a trace replays the rows tick by tick and agrees with replay', { skip: SKIP }, async () => {
+  const sc = scene();
+  const r = await runJob(cells, { scene: sc, expert: fake('hold'), time_limit_s: 2, wall_s: 30 });
+  const cell = cells.get(sc);
+  const rp = replayCtrl(cell, sc, r.ctrl, r.n, 2);
+  const tr = traceCtrl(cell, sc, r.ctrl, r.n, 2);
+  assert.equal(tr.format, TRACE_FORMAT);
+  assert.deepEqual([tr.outcome, tr.tick, tr.hash, tr.rows], [rp.outcome, rp.tick, rp.hash, rp.rows]);
+  assert.equal(tr.ticks.length, tr.tick + 1);
+  assert.equal(tr.ticks[0].row, null);
+  const k = tr.ticks[5];
+  assert.equal(k.row.length, 7);
+  assert.equal(k.q.length, 6);
+  assert.equal(k.tcp.length, 3);
+  assert.equal(k.tcp_quat.length, 4);
+  assert.ok(Array.isArray(k.held) && Array.isArray(k.touch) && typeof k.target.above_line_mm === 'number');
+  assert.match(tr.reasons[0], /^timed_out at tick 40/);
+  assert.ok(tr.reasons.some((x) => /never closed the grip/.test(x)));
+  assert.ok(tr.reasons.some((x) => /never touched the target|first touched the target/.test(x)));
+  const none = traceCtrl(cell, sc, '', 0, 1);
+  assert.equal(none.rows, 0);
+  assert.equal(none.held, 20);
+  assert.ok(none.ticks.slice(1).every((x) => x.after_rows));
+  assert.throws(() => traceCtrl(cell, sc, r.ctrl, r.n + 1, 2), /not n =/);
+});
+
+test('matQuat turns a rotation matrix into w, x, y, z', () => {
+  assert.deepEqual(matQuat([1, 0, 0, 0, 1, 0, 0, 0, 1]), [1, 0, 0, 0]);
+  const q = matQuat([1, 0, 0, 0, -1, 0, 0, 0, -1]);
+  assert.ok(Math.abs(q[1]) > 0.999 && Math.abs(q[0]) < 1e-9);
+  const c = Math.SQRT1_2, z = matQuat([0, -1, 0, 1, 0, 0, 0, 0, 1]);
+  assert.ok(Math.abs(z[0] - c) < 1e-9 && Math.abs(z[3] - c) < 1e-9);
 });

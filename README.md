@@ -18,8 +18,13 @@ flowchart LR
 
 ```bash
 git clone https://github.com/robotensor/vector-env && cd vector-env
-scripts/setup.sh            # vector-sim next to this folder (cloned if missing), .venv, Node parts, the asset bundle
+scripts/setup.sh            # vector-sim next to this folder (cloned at the pinned tag if missing), .venv, Node parts, the asset bundle
 ```
+
+`setup.sh` clones vector-sim at `VECTOR_SIM_REF`, the tag `ARG VECTOR_SIM_REF=` in `example/Dockerfile` (now
+`v0.1.0`): one pin, so local runs, the example image and the round's harness use the same simulator. A vector-sim
+already beside this folder is kept; when it is a git checkout at another commit, setup prints a warning with the
+`git checkout` that fixes it. `VECTOR_SIM_REF=<tag, branch or sha>` overrides the pin, `VECTOR_SIM_GIT` the repository.
 
 Python 3.12 (`requires-python >=3.12`, `.python-version`), Node 22 or newer (`.nvmrc`: 24). `setup.sh` uses `uv`
 when it is installed, else `python3 -m venv`; `requirements.lock` pins every package with its hashes and is installed
@@ -77,28 +82,81 @@ flowchart LR
 
 ```bash
 vector-env scene --seed 7 [--summary] [--draw JSON]
-vector-env run --command "node example/solve.mjs" --scenes 20 --seed 1 [--workers 4] [--results FILE]
+vector-env run --command "node example/solve.mjs" --scenes 20 --seed 1 [--workers 4] [--results FILE] [--stderr DIR]
+               [--trace DIR] [--scene-cache DIR | --no-scene-cache]
 vector-env run --image ghcr.io/<you>/<repo>@sha256:<digest> --scenes 20 --seed 1 [--pull] [--time-limit 15] [--wall 45]
                [--cpus 4] [--memory 8g] [--docker docker] [--draw JSON]
-vector-env replay --scene scene.json --result result.json [--time-limit 15]
+vector-env replay --scene scene.json --result result.json [--time-limit 15] [--trace FILE]
 vector-env assets pull [--version V] [--source S] [--force] | dir | info [--verify] | manifest --version V | pack --out DIR
 ```
 
 - `run --results FILE` writes one JSON line per scene (outcome, robot time, the rows sent as `ctrl` and `n`, timings,
   `infra`).
+- `run --stderr DIR` writes the expert's stderr of every scene to `DIR/<index, 4 digits>-<scene_id>.log`, e.g.
+  `0000-s121011998878783-4a5b69a2.log`.
 - `run --pull` pulls the image only when it is not on this machine, within the size limits below.
-- `replay` re-simulates a stored result's rows on its scene and prints the outcome.
+- `run --workers N` runs N scenes at a time and also generates N scenes at a time. Generating a scene (settling the
+  parts) takes about 2 s and dominates short runs, so `run` keeps every generated scene in a cache folder and reuses
+  it on the next run with the same seed: `~/.cache/vector-env/scenes/<env version>/<assets sha256>/<draw key>/<seed>/<index>.json`
+  (also the indexes none of whose draws places a scene). `--scene-cache DIR` or `VECTOR_ENV_SCENE_CACHE=DIR` moves
+  it, `--no-scene-cache` or `VECTOR_ENV_SCENE_CACHE=off` turns it off; delete the folder to clear it. The summary
+  shows `generate_s`, `scenes_cached` and the `scene_cache` folder. Compare variants of your expert on the same
+  `--seed`: they then run on the same scenes, and only the first run generates them.
+- `run --trace DIR` replays every scene after the run and writes `DIR/<index, 4 digits>-<scene_id>.json` (below);
+  for each failed scene it prints a `why` line.
+- `replay` re-simulates a stored result's rows on its scene and prints the outcome; `--trace FILE` also writes the
+  scene's trace and prints why it ended.
 - `--draw` overrides the random draw (`draw` in `vector_env/env.yaml`) to experiment; the round uses the defaults.
+
+### Inspect a failure
+
+```mermaid
+flowchart LR
+  I["--seed, index"] --> C{"in the scene cache?"}
+  C -->|"yes"| S["scene"]
+  C -->|"no: --workers at a time"| G["scenes.draw_index"] --> K["cache file"] --> S
+  S --> H["harness.run"] --> R["results (--results)"]
+  R --> T["--trace: replay tick by tick"] --> F["DIR/index-scene_id.json, why lines"]
+```
+
+```bash
+.venv/bin/vector-env run --command "node example/solve.mjs" --scenes 30 --seed 1 --workers 4 --results r.jsonl --trace traces
+#   why s27260578352828-f7734b96: timed_out at tick 300 (15 s): 15 s | the expert sent 300 rows | the gripper first
+#   touched the target (part 1) at tick 51 | ... | the target was held for 18 ticks (ticks 52-69); it was not held
+#   from tick 70 | its lowest point got to 202.3 mm below the lift line (the bin rim + 0.05 m) at tick 69
+
+.venv/bin/vector-env scene --seed 27260578352828 > scene.json          # the scene again (its seed is in the scene_id)
+.venv/bin/vector-env replay --scene scene.json --result r.jsonl --trace one.json
+```
+
+A trace (`format: vector-env-trace/1`) re-simulates the result's rows with the round's rules and records:
+
+| field | what |
+|---|---|
+| `outcome`, `tick`, `t`, `detail`, `part`, `hash` | the rules' verdict (the same as `replay`) |
+| `rows`, `sent`, `held` | rows stepped before the verdict, rows the expert sent, ticks the last row was held after them |
+| `reasons` | why it ended, in words: the verdict, the rows, first touch of the target, when the rows close the grip and whether the fingers shut on nothing, when the target was held, how high its lowest point got against the lift line, parts that left the bin. When the harness ended the scene itself (`expert_error`, `wall_timeout`) the first reason says so |
+| `summary` | the same as numbers: `target_first_touch`, `target_held` (tick ranges), `other_held`, `grip_first_asked`, `grip_first_shut`, `shut_on_nothing`, `target_max_above_line_mm`, `target_held_above_line_ticks`, `nearest_mm`/`nearest_tick` (tcp to the target's center), `left_bin` |
+| `ticks[k]` | per tick (0 = the start): `row` (the 7 values stepped), `q` (arm joints, rad), `grip` (0..1), `shut` (the fingers fully closed), `tcp` (m, world), `tcp_quat` (w, x, y, z), `held` (parts between both pads), `touch` (parts touching the gripper), `target` (`pos`, `above_line_mm`, `inside`, `dist_mm`); `after_rows` marks ticks after the expert's last row |
+| `lift_line_z`, `hold_s`, `tick_s`, `time_limit_s`, `target`, `result` | the rule constants of the scene, and the run's own result when one was given |
+
+A success needs the target held between both pads, its lowest point above `lift_line_z` (the bin rim +
+`lift_clear`) and no other part above it, for `hold_s` in a row. `harness.trace(scene, ctrl, n, time_limit_s=15,
+result=r)` returns the same in Python.
 
 ## Python
 
 ```python
 from vector_env import scenes, harness, rules, assets
 
-sc = scenes.generate(7)
+sc, err = scenes.draw_index(7, 0)       # index 0 of seed 7, retried like the round (None, err when no draw places one)
 res = harness.run({"command": ["node", "example/solve.mjs"]}, [sc], time_limit_s=15, wall_s=45)
 harness.replay(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15)
+harness.trace(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15, result=res[0])
 ```
+
+`scenes.generate(seed)` makes the scene of one exact seed and raises `SceneError` on the few seeds whose parts
+cannot be placed; `scenes.draw_index(seed, index)` (and `draw_scene(seed0)`) try the next seeds as the round does.
 
 For images: `harness.run(..., pull=True)` pulls a missing image first; `harness.ensure_image(image)`,
 `harness.pull(image)` (always pulls, raising `PullFailed`, `ImageTooLarge` or `DockerUnavailable`, all

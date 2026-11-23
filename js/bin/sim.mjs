@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Cells, settle, restore, replayCtrl, lines, bundleDir } from '../src/index.js';
+import { Cells, settle, restore, replayCtrl, traceCtrl, lines, bundleDir } from '../src/index.js';
 
 const cells = await new Cells(bundleDir()).init();
 
@@ -21,6 +21,10 @@ await lines(async (m) => {
   if (m.op === 'replay') {
     const cell = cells.get(sc);
     return { id: m.id ?? null, ...replayCtrl(cell, sc, m.ctrl, m.n, m.time_limit_s) };
+  }
+  if (m.op === 'trace') {
+    const cell = cells.get(sc);
+    return { id: m.id ?? null, ...traceCtrl(cell, sc, m.ctrl, m.n, m.time_limit_s) };
   }
   if (m.op === 'ping') return { id: m.id ?? null, ok: true };
   throw new Error(`unknown op ${JSON.stringify(m.op)}`);

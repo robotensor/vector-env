@@ -101,7 +101,7 @@ def test_a_broken_generator_is_one_line(monkeypatch, capsys):
 
 
 def test_image_without_docker_is_not_a_score(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(cli, "draw_scenes", lambda n, seed, draw=None, log=None: (_fake_scenes(n), []))
+    monkeypatch.setattr(cli, "draw_scenes", lambda n, seed, draw=None, log=None, **k: (_fake_scenes(n), []))
     rows = tmp_path / "r.jsonl"
     assert cli.main(["run", "--image", "ghcr.io/a/b:1", "--docker", str(tmp_path / "no-docker"), "--scenes", "2",
                      "--results", str(rows)]) == 2

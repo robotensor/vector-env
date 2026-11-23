@@ -10,6 +10,11 @@ ROOT = HERE.parent
 needs_bundle = pytest.mark.skipif(assets.find() is None, reason=assets.MISSING)
 
 
+@pytest.fixture(autouse=True)
+def _scene_cache(tmp_path_factory, monkeypatch):
+    monkeypatch.setenv("VECTOR_ENV_SCENE_CACHE", str(tmp_path_factory.mktemp("scene-cache")))
+
+
 @pytest.fixture(scope="session")
 def scenes3():
     from vector_env import scenes

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import assets
 from .node import NodeProc, sim
-from .rules import INFRA_OUTCOMES
+from .rules import HARNESS_OUTCOMES, INFRA_OUTCOMES
 from .settings import env_config
 
 GB = 1 << 30
@@ -233,8 +233,12 @@ def _expert_spec(expert: dict, docker: dict | None, bundle: Path, cids: str | No
     return spec
 
 
+def scene_file(folder: str | Path, index: int, scene: dict, ext: str) -> Path:
+    return Path(folder) / f"{index:04d}-{scene.get('scene_id') or 'scene'}.{ext}"
+
+
 def stderr_path(stderr_dir: str | Path, index: int, scene: dict) -> Path:
-    return Path(stderr_dir) / f"{index:04d}-{scene.get('scene_id') or 'scene'}.log"
+    return scene_file(stderr_dir, index, scene, "log")
 
 
 def _wire(scene: dict) -> dict:
@@ -335,6 +339,25 @@ def replay(scene: dict, ctrl_b64: str, n: int, *, time_limit_s: float, result: d
     r = sim(assets.ensure()).call({"op": "replay", "scene": _wire(scene), "ctrl": ctrl_b64, "n": int(n),
                                    "time_limit_s": float(time_limit_s)})
     r.pop("id", None)
+    return r
+
+
+def trace(scene: dict, ctrl_b64: str, n: int, *, time_limit_s: float, result: dict | None = None) -> dict:
+    if result is not None:
+        check_replay(scene, result)
+    r = sim(assets.ensure()).call({"op": "trace", "scene": _wire(scene), "ctrl": ctrl_b64, "n": int(n),
+                                   "time_limit_s": float(time_limit_s)})
+    r.pop("id", None)
+    if result is None:
+        return r
+    got = result.get("outcome")
+    r["result"] = {k: result.get(k) for k in ("outcome", "success", "t", "n", "error", "detail", "wall_s")}
+    if got in HARNESS_OUTCOMES:
+        r["reasons"].insert(0, f"the harness ended the scene as {got}: {result.get('error')}; the expert's rows end "
+                               f"at tick {n}, and the trace holds the last row from there until the rules decide")
+    elif got is not None and got != r["outcome"]:
+        r["reasons"].insert(0, f"warning: the run gave {got}, this replay {r['outcome']}: the run's simulator or "
+                               "scene differs from this one")
     return r
 
 

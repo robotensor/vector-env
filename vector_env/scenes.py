@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -115,3 +118,63 @@ def draw_index(seed: int, index: int, draw: dict | None = None, *, salt: str = "
 
 def _wire(scene: dict) -> dict:
     return {k: scene.get(k) for k in ("scene_id", "xml", "meta", "checkpoint", "state_hash", "target")}
+
+
+def scene_cache_root(path: str | Path | None = None) -> Path | None:
+    p = os.environ.get("VECTOR_ENV_SCENE_CACHE") if path is None else str(path)
+    if p is None:
+        return Path.home() / ".cache" / "vector-env" / "scenes"
+    if p.strip().lower() in ("", "off"):
+        return None
+    return Path(p).expanduser()
+
+
+def draw_key(draw: dict | None = None) -> str:
+    D = {**default_draw(), **(draw or {})}
+    return hashlib.sha256(json.dumps(D, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+class SceneCache:
+    def __init__(self, root: str | Path, env: dict, draw: dict | None = None):
+        self.env = {k: env.get(k) for k in ("version", "assets_version", "assets_sha256")}
+        self.dir = Path(root) / str(self.env["version"]) / str(self.env["assets_sha256"]) / draw_key(draw)
+
+    def path(self, seed: int, index: int) -> Path:
+        return self.dir / str(int(seed)) / f"{int(index)}.json"
+
+    def get(self, seed: int, index: int, salt: str = "", tries: int = SEED_TRIES):
+        try:
+            x = json.loads(self.path(seed, index).read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(x, dict):
+            return None
+        if x.get("skipped") is True and isinstance(x.get("error"), str):
+            return None, SceneError(x["error"])
+        env = x.get("env")
+        if not all(k in x for k in KEYS) or not isinstance(env, dict) or {k: env.get(k) for k in self.env} != self.env:
+            return None
+        if not 0 <= int(x["seed"]) - seed_for(seed, index, salt) < tries:
+            return None
+        return x, None
+
+    def put(self, seed: int, index: int, scene: dict | None, err: Exception | None) -> bool:
+        if scene is None and not isinstance(err, SceneError):
+            return False
+        if scene is not None and (not all(k in scene for k in KEYS) or not isinstance(scene.get("env"), dict)
+                                  or {k: scene["env"].get(k) for k in self.env} != self.env):
+            return False
+        doc = scene if scene is not None else {"skipped": True, "error": str(err)}
+        p = self.path(seed, index)
+        tmp = None
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(doc, f, separators=(",", ":"))
+            os.replace(tmp, p)
+        except OSError:
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
+            return False
+        return True

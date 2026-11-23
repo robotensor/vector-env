@@ -2,8 +2,25 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SIM=../vector-sim
+SIM_REF=${VECTOR_SIM_REF:-$(sed -n 's/^ARG VECTOR_SIM_REF=\([^[:space:]]*\).*/\1/p' example/Dockerfile)}
+if [ -z "$SIM_REF" ]; then
+  echo "setup: example/Dockerfile has no ARG VECTOR_SIM_REF=<tag> and VECTOR_SIM_REF is not set" >&2
+  exit 1
+fi
+check_ref() {
+  local dir=$1 ref=$2 name=$3 have want
+  have=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  want=$(git -C "$dir" rev-parse -q --verify "$ref^{commit}" 2>/dev/null) || want=
+  if [ -z "$want" ]; then
+    echo "setup: warning: $dir does not have $ref; fetch it (git -C $dir fetch --tags) and check it out, or local runs use another $name than the round's" >&2
+  elif [ "$have" != "$want" ]; then
+    echo "setup: warning: $dir is at ${have:0:12}, not $ref; local runs then use another $name than the round's (git -C $dir checkout $ref)" >&2
+  fi
+}
 if [ ! -d "$SIM/js" ]; then
-  git clone --depth 1 --branch "${VECTOR_SIM_REF:-main}" "${VECTOR_SIM_GIT:-https://github.com/robotensor/vector-sim}" "$SIM"
+  git clone --depth 1 --branch "$SIM_REF" "${VECTOR_SIM_GIT:-https://github.com/robotensor/vector-sim}" "$SIM"
+else
+  check_ref "$SIM" "$SIM_REF" vector-sim
 fi
 (cd "$SIM/js" && npm ci --no-audit --no-fund)
 if [ -z "${VECTOR_ENV_JS_ONLY:-}" ]; then

@@ -81,3 +81,8 @@ def sim(bundle: Path) -> NodeProc:
     if key not in procs:
         procs[key] = NodeProc("sim.mjs", bundle)
     return procs[key]
+
+
+def close_thread_sims() -> None:
+    for p in (getattr(_local, "procs", None) or {}).values():
+        p.close()
