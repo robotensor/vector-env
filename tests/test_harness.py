@@ -57,6 +57,7 @@ def test_observation_on_request(scene):
 def test_bad_experts(scene, mode, match):
     r = harness.run(fake(mode), [scene], time_limit_s=15, wall_s=30)[0]
     assert r["outcome"] == "expert_error" and not r["success"] and match in r["error"], r
+    assert r.get("exit_code") == (3 if mode == "crash" else None), r
 
 
 @pytest.mark.parametrize("mode,match", [("longline", "longer than 1024 KiB"), ("nonl", "longer than 1024 KiB"),

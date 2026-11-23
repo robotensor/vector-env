@@ -270,7 +270,9 @@ Every result has `outcome` and `infra`. The pick rules give `success`, `missed`,
 | `start_failed` | yes | the expert command could not be started, or docker never created the container (no `--cidfile` written: daemon error, bad option, image pruned meanwhile) |
 | `scene_error` | yes | the scene does not restore to its state hash (not the expert's doing) |
 | `harness_error` | yes | the harness itself crashed |
+| `policy_unavailable` | yes | never set by the harness: a caller (vector-server) gives it to its own command expert's `expert_error` with `exit_code` 75 (vector-policy's `expert.mjs` when its policy service is unavailable) |
 
+A result whose expert process exited also has `exit_code` (the process's exit code, or the signal name).
 `infra: true` results say nothing about the expert: re-run them rather than score them. Only signals the expert
 cannot fake decide this (the container's own exit code, 125 included, stays `expert_error`); a container that was
 created but failed to start counts as `expert_error`. `harness.summary()` counts them in `infra`. Before an image

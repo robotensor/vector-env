@@ -5,7 +5,7 @@ import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, 
 
 const STDERR_TAIL = 2000;
 const STDERR_FILE_MAX = 16 << 20;
-export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed'];
+export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed', 'policy_unavailable'];
 const IO = { max_line_kib: 1024, max_queued: 4, max_read_mib: 64, max_unread_mib: 16 };
 
 function ioLimits(io) {
@@ -321,7 +321,7 @@ export async function runJob(cells, job) {
         if (ex.broken) return ss.stop('expert_error', ex.broken);
         if (ex.spawnError) return ss.stop(job.expert.docker ? 'docker_unavailable' : 'start_failed', `could not start the expert: ${ex.spawnError}`);
         if (neverStarted()) return ss.stop('start_failed', `the container was not created (docker exited ${ex.exit})${tail(ex)}`);
-        return ss.stop('expert_error', `the expert exited (${ex.exit})${tail(ex)}`);
+        return Object.assign(ss.stop('expert_error', `the expert exited (${ex.exit})${tail(ex)}`), { exit_code: ex.exit });
       }
       const out = ss.act(line, got - sent);
       if (out.state) {
