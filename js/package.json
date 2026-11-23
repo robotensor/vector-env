@@ -12,7 +12,8 @@
   },
   "bin": {
     "vector-env-sim": "./bin/sim.mjs",
-    "vector-env-harness": "./bin/harness.mjs"
+    "vector-env-harness": "./bin/harness.mjs",
+    "vector-env-verify": "./bin/verifier.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.js"
