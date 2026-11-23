@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 
 from . import assets
+from . import policy as P
 from .node import NodeProc, SimCrashed, sim
 from .rules import HARNESS_OUTCOMES, INFRA_OUTCOMES
 from .settings import env_config
@@ -277,7 +278,7 @@ def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float,
         stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
         max_restarts: int | None = None, first_step_deadline_s: float | None = None,
         restarts_used: list[int] | None = None) -> list[dict]:
-    if expert.get("remote") is not None:
+    if expert.get("remote") is not None or expert.get("policy") is not None:
         coro = arun(expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers, io=io,
                     on_result=on_result, step_deadline_s=step_deadline_s, max_restarts=max_restarts,
                     first_step_deadline_s=first_step_deadline_s, restarts_used=restarts_used)
@@ -521,6 +522,9 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
                stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
                max_restarts: int | None = None, first_step_deadline_s: float | None = None,
                restarts_used: list[int] | None = None) -> list[dict]:
+    if expert.get("policy") is not None:
+        return await _policy_run(expert["policy"], scenes, time_limit_s=float(time_limit_s), wall_s=float(wall_s),
+                                 workers=workers, on_result=on_result)
     if expert.get("remote") is None:
         return await asyncio.to_thread(run, expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers,
                                        docker=docker, io=io, on_result=on_result, pull=pull, stderr_dir=stderr_dir)
@@ -668,6 +672,96 @@ async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_l
         return _fail(sc, "harness_error", f"{type(e).__name__}: {e}"[:500], time.monotonic() - t0), False
     finally:
         mux.drop(key)
+
+
+async def _policy_run(spec: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int,
+                      on_result) -> list[dict]:
+    bundle = assets.ensure()
+    out: list[dict | None] = [None] * len(scenes)
+    todo = iter(range(len(scenes)))
+    procs: list[NodeProc] = []
+
+    async def worker() -> None:
+        proc = NodeProc("harness.mjs", bundle)
+        procs.append(proc)
+        for i in todo:
+            r = await _policy_scene(proc, spec, scenes[i], time_limit_s=time_limit_s, wall_s=wall_s)
+            if r.get("scene_id") is None:
+                r["scene_id"] = scenes[i].get("scene_id")
+            r["infra"] = r.get("outcome") in INFRA_OUTCOMES
+            out[i] = r
+            if on_result:
+                await _maybe(on_result(i, r))
+
+    try:
+        await asyncio.gather(*(worker() for _ in range(max(1, min(int(workers), len(scenes) or 1)))))
+    finally:
+        for p in procs:
+            await asyncio.to_thread(p.close)
+    return [r if r is not None else _fail(scenes[i], "harness_error", "not run", 0.0) for i, r in enumerate(out)]
+
+
+async def _policy_scene(proc: NodeProc, spec: dict, sc: dict, *, time_limit_s: float, wall_s: float) -> dict:
+    call = lambda m: asyncio.to_thread(proc.call, m, wall_s + 120)
+    url, token = str(spec["url"]), str(spec.get("token") or "")
+    calls, timeout = int(spec.get("calls") or 40), float(spec.get("timeout_s") or 60)
+    episode = str(spec.get("episode") or "policy")
+    t0 = time.monotonic()
+    model = None
+
+    async def stop(outcome: str, error: str) -> dict:
+        r = (await call({"op": "stop", "outcome": outcome, "error": error[:500]}))["result"]
+        r.pop("id", None)
+        return r
+
+    try:
+        got = await call({"op": "open", "scene": _wire(sc), "time_limit_s": time_limit_s})
+        if "result" in got:
+            r = got["result"]
+            r.pop("id", None)
+            return r
+        start = msg = got["start"]
+        max_rows = int(start["limits"]["max_rows"])
+        state, k = None, 0
+        while True:
+            left = max_rows - int(msg.get("tick") or 0)
+            rows, waited = [], 0.0
+            if k < calls and left > 0:
+                budget = wall_s - (time.monotonic() - t0)
+                if budget <= 0:
+                    r = await stop("wall_timeout", f"no verdict within the wall budget of {wall_s:g} s")
+                    break
+                sent = time.monotonic()
+                try:
+                    j = await asyncio.to_thread(P.post, url, token, P.request(start, msg, k, state, episode),
+                                                min(timeout, budget))
+                    rows = [] if j.get("give_up") else P.rows(j.get("ctrl"))[:left]
+                    why = act_error({"type": "act", "rows": rows})
+                    if why:
+                        raise ValueError(why)
+                except P.PolicyUnavailable as e:
+                    over = time.monotonic() - t0 >= wall_s
+                    r = await stop("wall_timeout" if over else "policy_unavailable", str(e))
+                    break
+                except (P.PolicyRefused, TypeError, ValueError) as e:
+                    r = await stop("expert_error", f"policy: {e}")
+                    break
+                waited = (time.monotonic() - sent) * 1000
+                model = j.get("model") or model
+                state = j.get("state")
+                k += 1
+            got = await call({"op": "act", "act": {"type": "act", "rows": rows, "obs": bool(rows)}, "wait_ms": waited})
+            if "state" in got:
+                msg = got["state"]
+                continue
+            r = got["result"]
+            r.pop("id", None)
+            break
+    except Exception as e:
+        await asyncio.to_thread(proc.close)
+        return _fail(sc, "harness_error", f"{type(e).__name__}: {e}"[:500], time.monotonic() - t0)
+    r["model"] = model
+    return r
 
 
 def compare(results_a: list[dict], results_b: list[dict]) -> dict:

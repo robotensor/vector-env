@@ -195,6 +195,24 @@ again from tick 0 with a new key, at most `max_restarts` times (`harness.remote.
 scene's first key is `"<index>.<restarts_used[i]>"` and it has only the rest of `max_restarts`. Any other exception
 from the channel is `harness_error`.
 
+A policy service (`vector-policy serve`, or anything that answers `POST /v1/act` in `vector-policy/2`) runs
+without a wrapper process:
+
+```python
+res = harness.run({"policy": {"url": "<policy-url>", "token": tok, "calls": 40, "timeout_s": 60,
+                              "episode": "run-1"}}, scene_list, time_limit_s=15, wall_s=45, workers=2)
+```
+
+For every call the harness posts the policy view: `meta` limited to `camera`, `config`, `crate`, `net`, `robot`,
+`table` and `tick_s` (no seed, spawns or parts), `qpos` cut to the robot's joints (`meta.robot.arm_joints_qpos`
+and `driver_qpos`), `obs`, `target`, the policy's own `state`, `call_in_try` and `episode` `"<episode>:<scene_id>"`.
+It never sends the scene's xml or checkpoint. It steps `ctrl[:max_rows - tick]`, asks for `obs` again, and after
+`give_up`, empty `ctrl` or `calls` calls holds the last row until the rules decide. A policy that does not answer
+within `timeout_s`, or answers 401, 403, 429 or 5xx, ends the scene `policy_unavailable` (infra, not the
+policy's try); a 400, 404, 413 or 422, an answer that is not JSON, or rows that fail `act_error` end it
+`expert_error`. The wall budget still applies (`wall_timeout`). Results carry `model`, the last model name the
+policy reported. Only this kind can produce `policy_unavailable`: nothing an expert or a remote peer sends maps to it.
+
 Every act is checked in Python before the simulator sees it (`harness.act_error(msg)`): `rows` must be a list of
 rows of 7 numbers (not `true`/`false`), each finite and within ±`harness.remote.max_abs` (100). A channel may also
 hand over `{"type":"invalid","scene_key","error"}` for an act it refused itself. A bad act, or any failure while the
