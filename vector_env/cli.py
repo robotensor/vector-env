@@ -28,7 +28,8 @@ def cmd_scene(a) -> int:
 
 
 def evaluate(expert: dict, n: int, seed: int, *, workers: int = 1, time_limit_s: float | None = None,
-             wall_s: float | None = None, docker: dict | None = None, draw: dict | None = None, log=_err) -> dict:
+             wall_s: float | None = None, docker: dict | None = None, draw: dict | None = None, log=_err,
+             pull: bool = False) -> dict:
     from . import harness, rules, scenes
     from .settings import env_config
     task = rules.task(time_limit_s if time_limit_s is not None else rules.defaults()["time_limit_s"])
@@ -46,7 +47,7 @@ def evaluate(expert: dict, n: int, seed: int, *, workers: int = 1, time_limit_s:
 
     t1 = time.time()
     res = harness.run(expert, scs, time_limit_s=task["time_limit_s"], wall_s=wall, workers=workers, docker=docker,
-                      on_result=show)
+                      on_result=show, pull=pull)
     out = harness.summary(res)
     out.update(seed=seed, time_limit_s=task["time_limit_s"], wall_s=wall, workers=workers,
                generate_s=round(gen_s, 1), run_s=round(time.time() - t1, 1))
@@ -72,12 +73,9 @@ def _docker(a) -> dict:
 
 
 def cmd_run(a) -> int:
-    from . import harness
     ex = _expert(a)
-    if ex.get("image") and a.pull:
-        harness.pull(ex["image"], _docker(a))
     r = evaluate(ex, a.scenes, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=_docker(a),
-                 draw=json.loads(a.draw) if a.draw else None)
+                 draw=json.loads(a.draw) if a.draw else None, pull=a.pull)
     if a.results:
         with open(a.results, "w") as f:
             for x in r["results"]:
@@ -140,7 +138,7 @@ def main(argv=None) -> int:
     r.add_argument("--cpus", type=float)
     r.add_argument("--memory")
     r.add_argument("--docker", help="the docker binary")
-    r.add_argument("--pull", action="store_true", help="docker pull the image first")
+    r.add_argument("--pull", action="store_true", help="docker pull the image first if it is not on this machine (size limits apply)")
     r.add_argument("--draw", help="JSON overrides of the random draw")
     r.add_argument("--results", help="write the per-scene results here (JSON lines)")
     p = sub.add_parser("replay", help="re-simulate a stored result's controls on its scene")

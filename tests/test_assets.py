@@ -104,3 +104,52 @@ def test_a_bundle_folder_is_not_a_source(env):
     src = tiny(env)
     with pytest.raises(assets.AssetsError, match="is a bundle folder"):
         assets.pull("t1", str(src), env / "out")
+
+
+@pytest.mark.parametrize("v", ["../..", "..", "a/../b", "a/b", "/abs", ".hidden", "", "a b", "x" * 80])
+def test_bad_versions_are_refused(env, monkeypatch, v):
+    monkeypatch.setenv("VECTOR_ENV_ASSETS_VERSION", v)
+    monkeypatch.setenv("VECTOR_ENV_ASSETS_SOURCE", str(env / "pub"))
+    victim = env / "victim"
+    victim.mkdir()
+    if v:
+        with pytest.raises(assets.AssetsError, match="bad asset version"):
+            assets.ensure()
+    with pytest.raises(assets.AssetsError, match="bad asset version"):
+        assets.pull(v, str(env / "pub"))
+    assert victim.is_dir()
+
+
+def _republish(env, version, edit):
+    man_p = env / "pub" / version / assets.MANIFEST
+    man = json.loads(man_p.read_text())
+    edit(man)
+    man_p.write_text(json.dumps(man))
+
+
+def test_manifest_paths_and_unlisted_archive_members_are_refused(env, monkeypatch, caplog):
+    import tarfile
+    src = tiny(env)
+    assets.write_manifest(src, "t4")
+    assets.pack(src, env / "pub")
+    with caplog.at_level("WARNING"):
+        d = assets.pull("t4", str(env / "pub"), env / "ok")
+    assert assets.verify(d) == [] and "no pinned sha256" in caplog.text
+    (d / "robot" / "extra.stl").write_bytes(b"x")
+    assert assets.verify(d) == ["robot/extra.stl (not in the manifest)"]
+    for bad in ("../escape.stl", "/etc/passwd", "robot/../a.stl", "robot//a.stl", "C:/x.stl", "assets.json"):
+        _republish(env, "t4", lambda m: m["files"].append([bad, "0" * 64, 1]))
+        with pytest.raises(assets.AssetsError, match="bad asset path"):
+            assets.pull("t4", str(env / "pub"), env / "out")
+        _republish(env, "t4", lambda m: m["files"].pop())
+    tar_p = env / "pub" / "t4" / assets.ARCHIVE
+    with tarfile.open(tar_p, "a") as tf:
+        (env / "junk").write_bytes(b"junk")
+        tf.add(env / "junk", arcname="robot/junk.stl")
+    with pytest.raises(assets.AssetsError, match="does not list"):
+        assets.pull("t4", str(env / "pub"), env / "out")
+    assert not (env / "out").exists()
+    man = assets.read_manifest(d)
+    man["files"].append(["../x", "0" * 64, 1])
+    (d / assets.MANIFEST).write_text(json.dumps(man))
+    assert any("bad entry" in b for b in assets.verify(d))

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mujoco, bundleFiles } from '@vector/sim/node.js';
 import { Cell, Episode, Camera, chooseTarget, b64encode, b64ToF64, CTRL } from '@vector/sim';
 
@@ -16,7 +17,7 @@ export class Cells {
   async init() { this.mj = await mujoco(); return this; }
 
   get(scene) {
-    const key = scene.meta.xml_sha256 || scene.xml;
+    const key = cellKey(scene);
     let cell = this.cache.get(key);
     if (cell) {
       this.cache.delete(key);
@@ -33,6 +34,14 @@ export class Cells {
     }
     return cell;
   }
+}
+
+export function cellKey(scene) {
+  const h = createHash('sha256');
+  h.update(String(scene.xml));
+  h.update('\0');
+  h.update(JSON.stringify(scene.meta ?? null));
+  return h.digest('hex');
 }
 
 export function setLimit(cell, timeLimitS) {

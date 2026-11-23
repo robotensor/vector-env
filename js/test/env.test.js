@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Cells, settle, restore, replayCtrl, runJob, limits, setLimit, FORMAT } from '../src/index.js';
+import { Cells, cellKey, settle, restore, replayCtrl, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
@@ -66,4 +66,39 @@ test('what an expert writes is bounded', { skip: SKIP }, async () => {
   assert.ok(long.wall_s < 5, String(long.wall_s));
   const lost = await runJob(cells, { scene: { ...sc, state_hash: undefined }, expert: fake('hold'), time_limit_s: 2, wall_s: 30 });
   assert.deepEqual([lost.outcome, lost.error], ['scene_error', 'the scene has no state hash']);
+});
+
+test('the cell cache keys on the xml and meta it is given, not on a claimed hash', { skip: SKIP }, () => {
+  const c = new Cells(BUNDLE, 2);
+  c.mj = cells.mj;
+  const claim = { ...base.meta, xml_sha256: 'same' };
+  const a = c.get({ ...base, meta: claim });
+  const cfg = JSON.parse(JSON.stringify(base.meta.config));
+  cfg.rules.hold_s += 1;
+  const b = c.get({ ...base, meta: { ...claim, config: cfg } });
+  assert.notEqual(b, a);
+  assert.equal(b.cfg.rules.hold_s, cfg.rules.hold_s);
+  assert.notEqual(cellKey({ ...base, xml: base.xml + ' ', meta: claim }), cellKey({ ...base, meta: claim }));
+  assert.equal(cellKey(JSON.parse(JSON.stringify(base))), cellKey(base));
+});
+
+test('start failures are infrastructure, a container exit is the expert\'s', { skip: SKIP }, async () => {
+  const sc = scene();
+  const nope = await runJob(cells, { scene: sc, expert: { argv: ['/nonexistent/expert'] }, time_limit_s: 2, wall_s: 10 });
+  assert.deepEqual([nope.outcome, nope.infra], ['start_failed', true]);
+  const dock = await runJob(cells, { scene: sc, expert: { argv: ['/nonexistent/docker'], docker: true, cidfile: '/nonexistent/c' }, time_limit_s: 2, wall_s: 10 });
+  assert.deepEqual([dock.outcome, dock.infra], ['docker_unavailable', true]);
+  const sh = (code) => ({ argv: ['/bin/sh', '-c', `exit ${code}`], docker: true, cidfile: path.join(HERE, `.nope-${process.pid}`) });
+  const nocid = await runJob(cells, { scene: sc, expert: sh(125), time_limit_s: 2, wall_s: 10 });
+  assert.deepEqual([nocid.outcome, nocid.infra], ['start_failed', true]);
+  const cid = path.join(HERE, `.cid-${process.pid}`);
+  const fs = await import('node:fs');
+  fs.writeFileSync(cid, 'c');
+  try {
+    const ran = await runJob(cells, { scene: sc, expert: { ...sh(125), cidfile: cid }, time_limit_s: 2, wall_s: 10 });
+    assert.deepEqual([ran.outcome, ran.infra], ['expert_error', false]);
+  } finally { fs.rmSync(cid, { force: true }); }
+  const held = await runJob(cells, { scene: sc, expert: fake('hold'), time_limit_s: 1, wall_s: 10 });
+  assert.equal(held.infra, false);
+  assert.ok(INFRA_OUTCOMES.includes('scene_error') && !INFRA_OUTCOMES.includes('expert_error'));
 });

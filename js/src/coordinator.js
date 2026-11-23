@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { CTRL, b64ToF64 } from '@vector/sim';
 import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, round } from './env.js';
 
 const STDERR_TAIL = 2000;
+export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed'];
 const IO = { max_line_kib: 1024, max_queued: 4, max_read_mib: 64, max_unread_mib: 16 };
 
 function ioLimits(io) {
@@ -144,9 +146,13 @@ export async function runJob(cells, job) {
     res.outcome = outcome;
     res.success = outcome === 'success';
     res.error = error;
+    res.infra = INFRA_OUTCOMES.includes(outcome);
     res.wall_s = round((performance.now() - t0) / 1000, 3);
     return res;
   };
+  const tail = (ex) => { const t = ex.stderr.trim().split('\n').slice(-5).join(' | '); return t ? ': ' + t : ''; };
+  const cid = job.expert && job.expert.cidfile;
+  const neverStarted = () => !!cid && res.exchanges === 0 && !fs.existsSync(cid);
   let cell, ep;
   try {
     cell = cells.get(sc);
@@ -182,14 +188,19 @@ export async function runJob(cells, job) {
     for (;;) {
       const line = await Promise.race([ex.next(), wall]);
       const got = performance.now();
-      if (timedOut) { ctrlSoFar(); await ex.kill(job.expert.kill); return done('wall_timeout', `no verdict within the wall budget of ${wallS} s`); }
+      if (timedOut) {
+        ctrlSoFar();
+        await ex.kill(job.expert.kill);
+        if (neverStarted()) return done('start_failed', `the container did not start within ${wallS} s${tail(ex)}`);
+        return done('wall_timeout', `no verdict within the wall budget of ${wallS} s`);
+      }
       if (line === null) {
         ctrlSoFar();
         await ex.kill(job.expert.kill);
         if (ex.broken) return done('expert_error', ex.broken);
-        if (ex.spawnError) return done('harness_error', `could not start the expert: ${ex.spawnError}`);
-        const tail = ex.stderr.trim().split('\n').slice(-5).join(' | ');
-        return done('expert_error', `the expert exited (${ex.exit})${tail ? ': ' + tail : ''}`);
+        if (ex.spawnError) return done(job.expert.docker ? 'docker_unavailable' : 'start_failed', `could not start the expert: ${ex.spawnError}`);
+        if (neverStarted()) return done('start_failed', `the container was not created (docker exited ${ex.exit})${tail(ex)}`);
+        return done('expert_error', `the expert exited (${ex.exit})${tail(ex)}`);
       }
       wait.push(got - sent);
       res.exchanges++;

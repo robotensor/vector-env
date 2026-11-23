@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -124,3 +125,69 @@ def test_docker_mode(scene, tmp_path):
     assert (r["outcome"], r["n"]) == ("timed_out", 100)
     r = harness.run({"image": "fake:sleep"}, [scene], time_limit_s=5, wall_s=3, docker=D)[0]
     assert r["outcome"] == "wall_timeout"
+
+
+def _shim(tmp_path, state=None):
+    shim = tmp_path / "docker"
+    shim.write_text(f"#!/bin/sh\nexec {sys.executable} {HERE / 'fake_docker.py'} \"$@\"\n")
+    shim.chmod(0o755)
+    if state is not None:
+        (tmp_path / "state.json").write_text(json.dumps(state))
+    return {"binary": str(shim)}
+
+
+def _state(tmp_path):
+    return json.loads((tmp_path / "state.json").read_text())
+
+
+def test_infrastructure_failures_are_not_expert_failures(scene, tmp_path, monkeypatch):
+    import tempfile
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(tmp_path / "state.json"))
+    D = _shim(tmp_path, {"daemon": True, "local": {"fake:hold-20": 1000, "fake:nostart": 1000, "fake:exit125": 1000}})
+    one = lambda image, **k: harness.run({"image": image}, [scene], time_limit_s=5, wall_s=20, docker=D, **k)[0]
+    r = one("fake:nostart")
+    assert (r["outcome"], r["infra"]) == ("start_failed", True) and "not created" in r["error"], r
+    r = one("fake:exit125")
+    assert (r["outcome"], r["infra"]) == ("expert_error", False) and "exited (125)" in r["error"], r
+    r = one("fake:gone")
+    assert (r["outcome"], r["infra"], r["wall_s"]) == ("image_missing", True, 0.0), r
+    r = one("fake:hold-20")
+    assert (r["outcome"], r["infra"]) == ("timed_out", False), r
+    s = harness.summary([r, one("fake:nostart")])
+    assert s["infra"] == 1 and s["outcomes"] == {"start_failed": 1, "timed_out": 1}
+    r = harness.run({"image": "fake:hold"}, [scene, scene], time_limit_s=5, wall_s=20, docker={"binary": str(tmp_path / "none")})
+    assert [x["outcome"] for x in r] == ["docker_unavailable"] * 2 and all(x["infra"] for x in r)
+    _shim(tmp_path, {"daemon": False})
+    assert one("fake:hold-20")["outcome"] == "docker_unavailable"
+    r = harness.run(fake("hold"), [scene], time_limit_s=1, wall_s=20)[0]
+    assert r["infra"] is False
+    r = harness.run({"command": [str(tmp_path / "missing-binary")]}, [scene], time_limit_s=1, wall_s=20)[0]
+    assert (r["outcome"], r["infra"]) == ("start_failed", True), r
+    assert not list(tmp_path.glob("vector-env-cid-*"))
+
+
+def test_image_size_limit_before_and_after_pull(scene, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(tmp_path / "state.json"))
+    G = 1 << 30
+    D = {**_shim(tmp_path, {"daemon": True, "local": {},
+                            "remote": {"fake:hold-20": G // 2, "fake:big": 3 * G, "fake:bomb": G, "fake:flaky": G // 2},
+                            "unpacked": {"fake:bomb": 9 * G}, "pull_fail": ["fake:flaky"]}),
+         "max_image_gb": 2, "max_unpacked_gb": 6}
+    one = lambda image: harness.run({"image": image}, [scene], time_limit_s=5, wall_s=20, docker=D, pull=True)[0]
+    r = one("fake:big")
+    assert (r["outcome"], r["infra"]) == ("image_too_large", False) and "3.00 GB compressed" in r["error"], r
+    assert ["pull", "fake:big"] not in _state(tmp_path)["calls"]
+    r = one("fake:bomb")
+    assert r["outcome"] == "image_too_large" and "unpacked" in r["error"], r
+    assert "fake:bomb" not in _state(tmp_path)["local"] and ["image", "rm"] in _state(tmp_path)["calls"]
+    assert (one("fake:flaky")["outcome"], one("fake:nope")["outcome"]) == ("pull_failed", "pull_failed")
+    assert one("fake:hold-20")["outcome"] == "timed_out"
+    n = len(_state(tmp_path)["calls"])
+    assert one("fake:hold-20")["outcome"] == "timed_out" and len(_state(tmp_path)["calls"]) == n
+    with pytest.raises(harness.ImageTooLarge):
+        harness.pull("fake:big", D)
+    with pytest.raises(harness.PullFailed):
+        harness.pull("fake:flaky", D)
+    assert harness.remove_image("fake:hold-20", D) and harness.image_size("fake:hold-20", D) is None
+    assert harness.manifest_size("fake:hold-20", D) == G // 2

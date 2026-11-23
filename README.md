@@ -46,6 +46,11 @@ A folder source is what `vector-env assets pack --out <dir>` writes, one subfold
 A bundle folder itself (the one with `manifest.json`, `robot/`, `library/`, ...) is not a source: use it with
 `VECTOR_ENV_BUNDLE=<folder>`, or pack it first.
 
+`assets pull` refuses a version that is not letters, digits, `.`, `_` and `-` (starting with a letter or digit, at
+most 64 characters), a manifest path that is absolute or has `.`/`..`/empty segments, and an archive member the
+manifest does not list; `assets info --verify` also reports files in the folder that the manifest does not list.
+A version other than the pinned one has no sha256 to check its manifest against: the pull logs a warning.
+
 Where the bundle is looked for, in order (the one rule every tool and test suite of the Vector repos uses):
 
 1. `VECTOR_ENV_BUNDLE` (or `VECTOR_SIM_BUNDLE`), a bundle folder;
@@ -79,7 +84,9 @@ vector-env replay --scene scene.json --result result.json [--time-limit 15]
 vector-env assets pull [--version V] [--source S] [--force] | dir | info [--verify] | manifest --version V | pack --out DIR
 ```
 
-- `run --results FILE` writes one JSON line per scene (outcome, robot time, the rows sent as `ctrl` and `n`, timings).
+- `run --results FILE` writes one JSON line per scene (outcome, robot time, the rows sent as `ctrl` and `n`, timings,
+  `infra`).
+- `run --pull` pulls the image only when it is not on this machine, within the size limits below.
 - `replay` re-simulates a stored result's rows on its scene and prints the outcome.
 - `--draw` overrides the random draw (`draw` in `vector_env/env.yaml`) to experiment; the round uses the defaults.
 
@@ -91,6 +98,52 @@ from vector_env import scenes, harness, rules, assets
 sc = scenes.generate(7)
 res = harness.run({"command": ["node", "example/solve.mjs"]}, [sc], time_limit_s=15, wall_s=45)
 harness.replay(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15)
+```
+
+For images: `harness.run(..., pull=True)` pulls a missing image first; `harness.ensure_image(image)`,
+`harness.pull(image)` (always pulls, raising `PullFailed`, `ImageTooLarge` or `DockerUnavailable`, all
+`HarnessError` with an `outcome`), `harness.image_size(image)` (bytes on this machine, `None` when absent),
+`harness.manifest_size(image)` and `harness.remove_image(image)` (to prune after a round) are there for callers.
+
+## Outcomes
+
+Every result has `outcome` and `infra`. The pick rules give `success`, `missed`, `slipped`, `knocked_out`,
+`timed_out`, `wrong_part` (`rules.OUTCOMES`). The harness adds two groups (`rules.EXPERT_OUTCOMES`,
+`rules.INFRA_OUTCOMES`; `INFRA_OUTCOMES` also exported by the JS side):
+
+| outcome | `infra` | meaning |
+|---|---|---|
+| `expert_error` | no | the expert broke the protocol, gave up, exited, or the container exited after it was created |
+| `wall_timeout` | no | no verdict within the scene's wall budget |
+| `image_too_large` | no | the image's manifest (compressed) is above `harness.docker.max_image_gb`, or the pulled image is above `max_unpacked_gb` (it is removed again) |
+| `docker_unavailable` | yes | no docker binary, or the daemon does not answer |
+| `image_missing` | yes | the image is not on this machine and `pull` was not asked for |
+| `pull_failed` | yes | the manifest could not be read, or `docker pull` failed or ran past `pull_timeout_s` |
+| `start_failed` | yes | the expert command could not be started, or docker never created the container (no `--cidfile` written: daemon error, bad option, image pruned meanwhile) |
+| `scene_error` | yes | the scene does not restore to its state hash (not the expert's doing) |
+| `harness_error` | yes | the harness itself crashed |
+
+`infra: true` results say nothing about the expert: re-run them rather than score them. Only signals the expert
+cannot fake decide this (the container's own exit code, 125 included, stays `expert_error`); a container that was
+created but failed to start counts as `expert_error`. `harness.summary()` counts them in `infra`. Before an image
+runs, `harness.run` checks the daemon (`docker version`) and the image (`docker image inspect`); when either fails
+every scene gets the same infra outcome without running.
+
+```mermaid
+flowchart TD
+  R["harness.run(image)"] --> V{"docker version"}
+  V -->|"fails"| DU["docker_unavailable"]
+  V --> I{"docker image inspect"}
+  I -->|"absent, no pull"| IM["image_missing"]
+  I -->|"absent, pull"| M{"manifest size <= max_image_gb"}
+  M -->|"no"| TL["image_too_large"]
+  M -->|"unreadable / pull fails"| PF["pull_failed"]
+  M --> P["docker pull, size <= max_unpacked_gb"]
+  P -->|"no: image removed"| TL
+  I -->|"present"| S["per scene: docker run --cidfile"]
+  P --> S
+  S -->|"no cidfile, no protocol line"| SF["start_failed"]
+  S -->|"protocol"| O["rules outcome / expert_error / wall_timeout"]
 ```
 
 ## vector-expert/2
@@ -116,8 +169,10 @@ One JSON object per line on the expert's stdin and stdout.
 - Docker: `docker run --rm -i --pull never --network none --cpus 4 --memory 8g --memory-swap 8g --pids-limit 256
   --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1024m --cap-drop ALL --security-opt no-new-privileges --ipc private
   --ulimit nofile=1024:1024 --ulimit core=0 --user 65534:65534 -e HOME=/tmp -v <bundle>:/bundle:ro
-  -e VECTOR_SIM_BUNDLE=/bundle <image>` (`harness.docker` in `vector_env/env.yaml`). The image must already be
-  there (`--pull`), runs as an unprivileged user and can write only to `/tmp`. Run the docker daemon rootless or
+  -e VECTOR_SIM_BUNDLE=/bundle --cidfile <tmp>/<name>.cid <image>` (`harness.docker` in `vector_env/env.yaml`).
+  The image must already be there (`--pull`), runs as an unprivileged user and can write only to `/tmp`. Pulls are
+  capped: `max_image_gb` (10, compressed, read from `docker manifest inspect` before the pull), `max_unpacked_gb`
+  (30, `docker image inspect` after it) and `pull_timeout_s` (1800); 0 or null turns a cap off. Run the docker daemon rootless or
   with `userns-remap`, or set `harness.docker.userns`.
 
 `example/` is an almost blind expert (it shows the message loop and never looks at the scene) with its Dockerfile.
