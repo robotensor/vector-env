@@ -275,10 +275,11 @@ def _fail(scene: dict, outcome: str, error: str, wall: float) -> dict:
 def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
         docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
         stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
-        max_restarts: int | None = None) -> list[dict]:
+        max_restarts: int | None = None, first_step_deadline_s: float | None = None) -> list[dict]:
     if expert.get("remote") is not None:
         coro = arun(expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers, io=io,
-                    on_result=on_result, step_deadline_s=step_deadline_s, max_restarts=max_restarts)
+                    on_result=on_result, step_deadline_s=step_deadline_s, max_restarts=max_restarts,
+                    first_step_deadline_s=first_step_deadline_s)
         if expert.get("loop") is not None:
             return asyncio.run_coroutine_threadsafe(coro, expert["loop"]).result()
         try:
@@ -442,6 +443,20 @@ class _Mux:
     def drop(self, key: str) -> None:
         self.boxes.pop(key, None)
 
+    def paused(self) -> bool:
+        if self.closed:
+            return False
+        p = getattr(self.ch, "paused", None)
+        if p is None:
+            return False
+        return bool(p() if callable(p) else p)
+
+    async def resumed(self, box: _Box) -> float:
+        t = time.monotonic()
+        while self.paused() and box.q.empty():
+            await asyncio.sleep(0.05)
+        return time.monotonic() - t
+
     async def send(self, msg: dict) -> None:
         if self.closed:
             raise ChannelClosed(self.closed[1])
@@ -478,13 +493,15 @@ class _Mux:
 async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
                docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
                stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
-               max_restarts: int | None = None) -> list[dict]:
+               max_restarts: int | None = None, first_step_deadline_s: float | None = None) -> list[dict]:
     if expert.get("remote") is None:
         return await asyncio.to_thread(run, expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers,
                                        docker=docker, io=io, on_result=on_result, pull=pull, stderr_dir=stderr_dir)
     H = env_config()["harness"]
     R = H.get("remote") or {}
     deadline = float(step_deadline_s if step_deadline_s is not None else R.get("step_deadline_s", 2.0))
+    first = float(first_step_deadline_s if first_step_deadline_s is not None else
+                  R.get("first_step_deadline_s", max(deadline, 10.0)))
     restarts = int(max_restarts if max_restarts is not None else R.get("max_restarts", 2))
     queued = int({**(H.get("io") or {}), **(io or {})}.get("max_queued") or 4)
     bundle = assets.ensure()
@@ -503,7 +520,8 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
             while True:
                 key = f"{i}.{n}"
                 r, again = await _remote_scene(proc, mux, sc, key, time_limit_s=float(time_limit_s),
-                                               wall_s=float(wall_s), deadline=deadline, last=n >= restarts)
+                                               wall_s=float(wall_s), deadline=deadline, first=first,
+                                               last=n >= restarts)
                 if not again:
                     break
                 n += 1
@@ -529,7 +547,7 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
 
 
 async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_limit_s: float, wall_s: float,
-                        deadline: float, last: bool) -> tuple[dict, bool]:
+                        deadline: float, first: float, last: bool) -> tuple[dict, bool]:
     call = lambda m: asyncio.to_thread(proc.call, m, wall_s + 120)
     box = mux.open(key)
     t0 = time.monotonic()
@@ -561,17 +579,27 @@ async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_l
                                               "the connection closed")
                 return await stop(outcome, why, False), False
             sent = time.monotonic()
-            left = wall_s - (sent - t0)
-            wait = min(deadline, left)
-            try:
-                if wait <= 0:
-                    raise asyncio.TimeoutError
-                item, at = await asyncio.wait_for(box.q.get(), wait)
-            except asyncio.TimeoutError:
-                if deadline < left:
-                    return await stop("step_timeout", f"no act within the step deadline of {deadline:g} s "
-                                                      f"(tick {msg.get('tick')})"), False
-                return await stop("wall_timeout", f"no verdict within the wall budget of {wall_s:g} s"), False
+            cap, what = (first, "first-step deadline") if msg.get("type") == "start" else (deadline, "step deadline")
+            while True:
+                now = time.monotonic()
+                left = wall_s - (now - t0)
+                step = cap - (now - sent)
+                wait = min(step, left)
+                try:
+                    if wait <= 0:
+                        raise asyncio.TimeoutError
+                    item, at = await asyncio.wait_for(box.q.get(), wait)
+                    break
+                except asyncio.TimeoutError:
+                    if mux.paused():
+                        held = await mux.resumed(box)
+                        t0 += held
+                        sent = time.monotonic()
+                        continue
+                    if step < left:
+                        return await stop("step_timeout", f"no act within the {what} of {cap:g} s "
+                                                          f"(tick {msg.get('tick')})"), False
+                    return await stop("wall_timeout", f"no verdict within the wall budget of {wall_s:g} s"), False
             if item is _RESTART:
                 if last:
                     return await stop("disconnected", "the connection was replaced while the scene ran, "

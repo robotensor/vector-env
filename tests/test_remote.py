@@ -106,6 +106,24 @@ def test_reconnect_restarts_scenes_in_flight(scenes3):
     assert r["outcome"] == "disconnected" and "no restarts left" in r["error"], r
 
 
+def test_a_drop_longer_than_the_step_deadline_restarts_instead_of_timing_out(scenes3):
+    clean = remote(FakeMiner(), scenes3[:2], workers=2)
+    m = FakeMiner(drop=(6, 1.2))
+    r = remote(m, scenes3[:2], workers=2, step_deadline_s=0.3)
+    assert m.drops == 1
+    assert [x["restarts"] for x in r] == [1, 1] and [x["scene_key"] for x in r] == ["0.1", "1.1"], r
+    assert not any(x["outcome"] in ("step_timeout", "wall_timeout", "disconnected") for x in r), r
+    assert harness.compare(clean, r)["all_equal"]
+
+
+def test_the_first_act_has_its_own_deadline(scenes3):
+    r = remote(FakeMiner(first_delay_s=0.6), scenes3[:1], step_deadline_s=0.3, first_step_deadline_s=2)[0]
+    assert r["outcome"] != "step_timeout" and r["error"] is None, r
+    r = remote(FakeMiner(stall={"0.": 0}), scenes3[:1], step_deadline_s=0.3, first_step_deadline_s=0.5)[0]
+    assert r["outcome"] == "step_timeout" and "first-step deadline of 0.5 s (tick 0)" in r["error"], r
+    assert 0.5 <= r["wall_s"] < 5, r
+
+
 def test_async_and_threaded_entry_points(scenes3):
     async def main():
         with pytest.raises(RuntimeError, match="await harness.arun"):

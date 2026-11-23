@@ -170,18 +170,24 @@ class Channel:
     async def recv(self) -> dict: ...              # any message of any scene; raise harness.ChannelClosed when
                                                    # the peer is gone, harness.Reconnected when a new connection
                                                    # replaced it (scenes in flight start again)
+    def paused(self) -> bool: ...                  # optional: True while the peer is lost and may come back
 
 res = await harness.arun({"remote": Channel()}, scene_list, time_limit_s=15, wall_s=45, workers=8,
-                         step_deadline_s=2.0, max_restarts=2, on_result=cb)   # cb(i, r), plain or async
+                         step_deadline_s=2.0, first_step_deadline_s=10.0, max_restarts=2,
+                         on_result=cb)                                        # cb(i, r), plain or async
 res = harness.run({"remote": Channel()}, scene_list, ...)                      # no event loop running here
 res = harness.run({"remote": Channel(), "loop": loop}, scene_list, ...)        # from a thread; loop owns the channel
 harness.compare(res, harness.run({"image": ref}, scene_list[:100], time_limit_s=15, wall_s=45))
 ```
 
 `workers` scenes run at once, each with its own simulator. The harness adds `scene_key` (`"<index>.<restart>"`) to
-every message it sends and routes what comes back by it; messages with an unknown key are dropped. Each wait for an
-`act` has the step deadline (`harness.remote.step_deadline_s`, 2 s; the simulator is paused while it waits) and the
-scene's wall budget (`wall_s`, counted from the scene's setup) as caps. On `Reconnected` every scene in flight starts
+every message it sends and routes what comes back by it; messages with an unknown key are dropped. The wait for the
+first `act` after `start` has the first-step deadline (`harness.remote.first_step_deadline_s`, 10 s, time to plan);
+every later wait has the step deadline (`harness.remote.step_deadline_s`, 2 s); the simulator is paused while it
+waits, and the scene's wall budget (`wall_s`, counted from the scene's setup) caps both. While the channel's optional
+`paused()` (or a `paused` attribute) is true, no deadline and no wall budget runs out: a scene that would time out
+waits until the channel is back, then gets a fresh deadline, so a reconnect (`Reconnected`) restarts it and a close
+(`ChannelClosed`) ends it `disconnected`, never `step_timeout`. On `Reconnected` every scene in flight starts
 again from tick 0 with a new key, at most `max_restarts` times (`harness.remote.max_restarts`, 2); results carry
 `scene_key` and `restarts`. Any other exception from the channel is `harness_error`.
 
@@ -206,7 +212,7 @@ Every result has `outcome` and `infra`. The pick rules give `success`, `missed`,
 |---|---|---|
 | `expert_error` | no | the expert broke the protocol, gave up, exited, or the container exited after it was created |
 | `wall_timeout` | no | no verdict within the scene's wall budget |
-| `step_timeout` | no | remote: no `act` within the step deadline |
+| `step_timeout` | no | remote: no `act` within the first-step deadline (first act) or the step deadline (later acts) |
 | `disconnected` | no | remote: the channel closed, or it reconnected with no restarts left |
 | `image_too_large` | no | the image's manifest (compressed) is above `harness.docker.max_image_gb`, or the pulled image is above `max_unpacked_gb` (it is removed again) |
 | `docker_unavailable` | yes | no docker binary, or the daemon does not answer |

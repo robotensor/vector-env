@@ -8,11 +8,14 @@ from vector_env.harness import ChannelClosed, Reconnected
 
 class FakeMiner:
     def __init__(self, per=5, seed=0, noise=False, delay_s=(0.0, 0.004), stall=None, flood=False, error=False,
-                 close_after=None, reconnect_after=None, junk=False, broken_after=None):
+                 close_after=None, reconnect_after=None, junk=False, broken_after=None, drop=None, first_delay_s=0.0):
         self.per, self.noise, self.delay_s = per, noise, delay_s
         self.rng = random.Random(seed)
         self.stall, self.flood, self.error, self.junk = stall or {}, flood, error, junk
         self.close_after, self.reconnect_after, self.broken_after = close_after, reconnect_after, broken_after
+        self.drop, self.first_delay_s = drop, first_delay_s
+        self.paused = False
+        self.drops = 0
         self.inbox = None
         self.seen, self.rows, self.arm, self.ends = [], {}, {}, {}
         self.acts = 0
@@ -50,15 +53,23 @@ class FakeMiner:
         if self.noise:
             rows = [[x + random.uniform(-1e-9, 1e-9) for x in r] for r in rows]
         self.rows[key] += rows
-        asyncio.get_running_loop().create_task(self._reply(key, rows))
+        extra = self.first_delay_s if msg["type"] == "start" else 0.0
+        asyncio.get_running_loop().create_task(self._reply(key, rows, extra))
 
-    async def _reply(self, key, rows):
-        await asyncio.sleep(self.rng.uniform(*self.delay_s))
+    async def _reply(self, key, rows, extra=0.0):
+        await asyncio.sleep(self.rng.uniform(*self.delay_s) + extra)
         self._q().put_nowait({"type": "act", "scene_key": key, "rows": rows, "obs": False})
 
     async def recv(self):
         m = await self._q().get()
         self.acts += 1
+        if self.drop is not None and self.acts == self.drop[0]:
+            self.paused = True
+            self.drops += 1
+            await asyncio.sleep(self.drop[1])
+            self.paused = False
+            self.rows = {k: [] for k in self.rows}
+            raise Reconnected()
         if self.reconnect_after is not None and self.acts == self.reconnect_after:
             self.rows = {k: [] for k in self.rows}
             raise Reconnected()
