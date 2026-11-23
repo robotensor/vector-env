@@ -1,5 +1,5 @@
 import { replayRows, rowsHash, flatRows, probe as simProbe, CTRL } from '@vector/sim';
-import { setLimit, restore, SceneError } from './env.js';
+import { setLimit, restore, SceneError, outOfRange } from './env.js';
 
 export const VERIFY_FORMAT = 'vector-verify/1';
 
@@ -20,6 +20,10 @@ export function verifyRows(cell, scene, rows, { timeLimitS = null, hold = false,
   try { flat = flatRows(rows); } catch (e) { return refuse('malformed', e.message); }
   const n = flat.length / CTRL;
   if (n > budget) return refuse('over_budget', `the log has ${n} rows, the budget is ${budget} ticks (${lim} s)`);
+  if (claim && claim.in_range) {
+    const x = outOfRange(cell, flat);
+    if (x) return refuse('out_of_range', `row ${x.tick} column ${x.col + 1} is outside the actuator range`);
+  }
   const action_hash = rowsHash(flat);
   const r = replayRows(cell, { checkpoint: scene.checkpoint, target: scene.target }, flat, { every, hold });
   const out = { format: VERIFY_FORMAT, ok: true, reason: null, detail: null, outcome: r.outcome, success: r.outcome === 'success',

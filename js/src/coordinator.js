@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { CTRL, b64ToF64 } from '@vector/sim';
-import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, round } from './env.js';
+import { CTRL, b64ToF64, b64encode } from '@vector/sim';
+import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, round, appliedRows } from './env.js';
 
 const STDERR_TAIL = 2000;
 const STDERR_FILE_MAX = 16 << 20;
@@ -233,6 +233,7 @@ export class Session {
     if (!ep) return;
     if (ep.lastTry) { res.ctrl = ep.lastTry.seg.ctrl; res.n = ep.lastTry.ticks; }
     else if (ep.cur) { res.n = ep.cur.ticks; res.ctrl = Buffer.from(Float64Array.from(ep.cur.ctrl).buffer).toString('base64'); }
+    res.ctrl_applied = res.ctrl ? b64encode(new Uint8Array(appliedRows(this.cell, b64ToF64(res.ctrl)).buffer)) : '';
     res.tick = ep.cur ? ep.cur.ticks : ep.lastTry ? ep.lastTry.ticks : 0;
     res.t = round(res.tick * this.tickS);
   }

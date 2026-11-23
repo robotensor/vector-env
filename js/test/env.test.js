@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT, Session, actionHash, EMPTY_ACTION_HASH } from '../src/index.js';
+import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT, Session, actionHash, EMPTY_ACTION_HASH, ctrlRanges, appliedRows } from '../src/index.js';
+import { b64ToF64 } from '@vector/sim';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
@@ -168,4 +169,25 @@ test('matQuat turns a rotation matrix into w, x, y, z', () => {
   assert.ok(Math.abs(q[1]) > 0.999 && Math.abs(q[0]) < 1e-9);
   const c = Math.SQRT1_2, z = matQuat([0, -1, 0, 1, 0, 0, 0, 0, 1]);
   assert.ok(Math.abs(z[0] - c) < 1e-9 && Math.abs(z[3] - c) < 1e-9);
+});
+
+test('a result carries the rows the simulator applied, clamped to the actuator ranges; the hash stays over the sent rows', { skip: SKIP }, () => {
+  const sc = scene();
+  const ss = new Session(cells, { scene: sc, time_limit_s: 2 });
+  const { start } = ss.open();
+  const q = [...sc.meta.robot.arm_joints_qpos.map((i) => start.qpos[i]), 0];
+  const wild = [q[0], 9, q[2], q[3], -0, q[5], -1e6];
+  const loud = [...q.slice(0, 6), 1e300];
+  let out, k = 0;
+  do { out = ss.act({ type: 'act', rows: [k % 2 ? loud : wild] }, 1); k++; } while (out.state);
+  const res = out.result, lim = ctrlRanges(cells.get(sc));
+  assert.equal(res.action_hash, actionHash(Array.from({ length: k }, (_, i) => (i % 2 ? loud : wild))));
+  assert.deepEqual(Array.from(b64ToF64(res.ctrl).slice(0, 7)), wild);
+  const ap = b64ToF64(res.ctrl_applied);
+  assert.equal(ap.length, 7 * res.n);
+  for (let i = 0; i < ap.length; i++) assert.ok(ap[i] >= lim[i % 7][0] && ap[i] <= lim[i % 7][1], `${i} ${ap[i]}`);
+  assert.deepEqual(Array.from(ap.slice(0, 7)), [q[0], lim[1][1], q[2], q[3], 0, q[5], 0]);
+  assert.equal(ap[13], 1);
+  assert.ok(Object.is(ap[4], 0));
+  assert.deepEqual(Array.from(appliedRows(cells.get(sc), Float64Array.from(q))), q);
 });

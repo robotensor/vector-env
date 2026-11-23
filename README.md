@@ -236,7 +236,9 @@ verifier.rows_hash(rows), verifier.chain_seed(nonce, session, scene_id), verifie
   reach one, `rows_after_verdict` when it goes on. An expert's (`hold=True`) holds its last row until the verdict, as
   the harness does. More rows than `time_limit_s` allows is `over_budget`.
 - `claim` (optional): `marks` (`[tick, state hash]` pairs checked as the replay passes them: the first that differs is
-  `state_mismatch` with `divergence.tick`), `outcome`, `tick`, `state_hash` (final), `action_hash`. A scene whose
+  `state_mismatch` with `divergence.tick`), `outcome`, `tick`, `state_hash` (final), `action_hash`, `in_range`
+  (`true`: every joint must be within `meta.robot.joint_range` and the grip within 0..1, 1e-9 tolerance, else
+  `out_of_range` before the replay; the Teleop console's claims set it, an expert's result does not). A scene whose
   checkpoint does not restore to its `state_hash` is `scene_error`.
 - `VECTOR_ENV_VERIFIERS` (default 1) Node processes serve the calls; each keeps `VECTOR_ENV_VERIFY_CELLS` (3) compiled
   scenes.
@@ -245,7 +247,9 @@ verifier.rows_hash(rows), verifier.chain_seed(nonce, session, scene_id), verifie
 flowchart LR
   L["rows + claim"] --> V["verifier.verify"]
   S["scene"] --> V
-  V --> R["restore checkpoint = state_hash"] --> P["replay with the rules (try_s = time_limit_s)"]
+  V --> G{"in_range claimed: rows within the ranges"}
+  G -->|"no"| NO
+  G -->|"yes"| R["restore checkpoint = state_hash"] --> P["replay with the rules (try_s = time_limit_s)"]
   P --> M{"marks, verdict tick, final hash, action hash = claim"}
   M -->|"yes"| OK["ok: outcome, t, state_hash, action_hash"]
   M -->|"no"| NO["reason, divergence"]
@@ -323,6 +327,9 @@ One JSON object per line on the expert's stdin and stdout.
   hex, 16 digits; no rows gives `cbf29ce484222325`. Results the expert never ran for (image or docker problems, harness crashes)
   have `action_hash: null`.
 - A row is 6 arm joint targets (rad) and the grip, 0 (open) to 1 (closed); one row per tick of 1/20 s.
+- **Applied rows.** Every result also has `ctrl_applied`: the rows of `ctrl` as the simulator applied them, each arm
+  value clamped to its actuator `ctrlrange` and the grip to 0..1, `-0` as `0`. `ctrl` and `action_hash` stay the rows
+  the expert sent; training data uses `ctrl_applied`.
 - `rows: []` holds the last row until the rules decide. `"obs": true` adds an image to the next state.
 - `{"type":"error","error":"..."}` gives up. Anything else on stdout ends the scene as `expert_error`.
 - The try ends at the rules' verdict or at `time_limit_s` of robot time (`timed_out`); the scene's wall budget ends

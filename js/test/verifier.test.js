@@ -88,3 +88,24 @@ test('the probe is the same every time and leaves the scene as it was', { skip: 
   assert.equal(cell.hash(), sc.state_hash);
   assert.equal(a.marks.length, 8);
 });
+
+test('a console claim with a row outside the actuator ranges is refused before the replay', { skip: SKIP }, () => {
+  const { cell, sc, rows } = setup();
+  const cut = rows.slice(0, verifyRows(cell, sc, rows, { timeLimitS: 30 }).tick);
+  assert.equal(verifyRows(cell, sc, cut, { timeLimitS: 30, claim: { in_range: true } }).ok, true);
+  const hid = new Float64Array(1);
+  new BigUint64Array(hid.buffer)[0] = 0x4130000000000000n | 0x4e4f53494f50n;
+  for (const [col, v] of [[6, -1e6], [6, hid[0]], [6, 1.5], [0, 7], [2, -3.2]]) {
+    const bad = cut.map((x) => x.slice());
+    bad[3][col] = v;
+    const r = verifyRows(cell, sc, bad, { timeLimitS: 30, claim: { in_range: true } });
+    assert.equal(r.reason, 'out_of_range', `${col} ${v}`);
+    assert.equal(r.ok, false);
+  }
+  const edge = cut.map((x) => x.slice());
+  edge[3][6] = 1 + 2 ** -52;
+  assert.notEqual(verifyRows(cell, sc, edge, { timeLimitS: 30, claim: { in_range: true } }).reason, 'out_of_range');
+  const poisoned = cut.map((x) => x.slice());
+  poisoned[3][6] = -1e6;
+  assert.notEqual(verifyRows(cell, sc, poisoned, { timeLimitS: 30 }).reason, 'out_of_range');
+});

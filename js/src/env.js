@@ -52,6 +52,37 @@ export function setLimit(cell, timeLimitS) {
   return cell.cfg.rules.try_s;
 }
 
+export function ctrlRanges(cell) {
+  const m = cell.m, R = cell.R, cr = m.actuator_ctrlrange, on = m.actuator_ctrllimited;
+  const out = R.arm_actuators.map((a) => (on[a] ? [cr[2 * a], cr[2 * a + 1]] : [-Infinity, Infinity]));
+  const g = R.gripper_actuator, gmax = cell.cfg.control.gripper_ctrl_max;
+  out.push(on[g] ? [Math.max(0, cr[2 * g] / gmax), Math.min(1, cr[2 * g + 1] / gmax)] : [0, 1]);
+  return out;
+}
+
+export function appliedRows(cell, flat) {
+  const lim = ctrlRanges(cell), out = Float64Array.from(flat);
+  for (let k = 0; k < out.length; k++) {
+    const [lo, hi] = lim[k % CTRL];
+    const x = Math.min(hi, Math.max(lo, out[k]));
+    out[k] = x === 0 ? 0 : x;
+  }
+  return out;
+}
+
+export function rowRanges(cell) {
+  return [...cell.R.joint_range.map(([lo, hi]) => [lo, hi]), [0, 1]];
+}
+
+export function outOfRange(cell, flat, eps = 1e-9) {
+  const lim = rowRanges(cell);
+  for (let k = 0; k < flat.length; k++) {
+    const [lo, hi] = lim[k % CTRL];
+    if (!(flat[k] >= lo - eps && flat[k] <= hi + eps)) return { tick: Math.floor(k / CTRL), col: k % CTRL, value: flat[k] };
+  }
+  return null;
+}
+
 export function limits(cell) {
   const tickS = cell.meta.tick_s, t = cell.cfg.rules.try_s;
   return { time_limit_s: t, control_hz: Math.round(1 / tickS), tick_s: tickS, max_rows: Math.ceil(t / tickS - 1e-9) };

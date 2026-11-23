@@ -62,3 +62,24 @@ def test_the_probe_is_stable(scene):
     assert a == b and a["start"] == scene["state_hash"] and len(a["marks"]) == 8
     p = verifier.pin()
     assert len(p["code"]) == 64 and len(p["wasm"]) == 64 and p["mujoco"]
+
+
+@needs_bundle
+def test_a_console_claim_refuses_rows_outside_the_actuator_ranges_and_results_carry_the_applied_rows(solved):
+    sc, r = solved
+    v = verifier.verify_result(sc, r, time_limit_s=15)
+    raw = base64.b64decode(r["ctrl"])[: v["tick"] * 56]
+    claim = {"outcome": "success", "tick": v["tick"], "in_range": True}
+    assert verifier.verify(sc, raw, time_limit_s=30, claim=claim)["ok"]
+    vals = list(struct.unpack(f"<{len(raw) // 8}d", raw))
+    poison = struct.unpack("<d", struct.pack("<Q", 0x4130000000000000 | 0x4E4F53494F50))[0]
+    for col, x in ((6, -1e6), (6, poison), (1, 50.0)):
+        bad = vals[:]
+        bad[7 * 3 + col] = x
+        out = verifier.verify(sc, struct.pack(f"<{len(bad)}d", *bad), time_limit_s=30, claim=claim)
+        assert not out["ok"] and out["reason"] == "out_of_range", out
+    ap = struct.unpack(f"<{r['n'] * 7}d", base64.b64decode(r["ctrl_applied"]))
+    lim = sc["meta"]["robot"]["joint_range"]
+    for k, x in enumerate(ap):
+        lo, hi = (0.0, 1.0) if k % 7 == 6 else lim[k % 7]
+        assert lo <= x <= hi
