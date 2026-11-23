@@ -2,7 +2,8 @@
 
 The Vector bin-picking environment: the scene generator, the versioned asset bundle, the task rules and the
 `vector-expert/2` step harness. The simulator (vector-sim) runs here, outside the expert; the expert runs as a
-local command or a docker image with no network and answers with control rows step by step.
+local command, a docker image with no network, or a remote process behind a message channel, and answers with
+control rows step by step.
 
 ```mermaid
 flowchart LR
@@ -10,8 +11,10 @@ flowchart LR
   A["assets.ensure()"] --> G
   S --> H["harness.run()"]
   H <-->|"vector-expert/2 (JSON lines)"| X["expert: command or docker --network none"]
-  H --> R["per-scene results"]
+  H <-->|"vector-expert/2 + scene_key"| C["remote expert: channel send/recv"]
+  H --> R["per-scene results + action_hash"]
   R --> P["harness.replay()"]
+  R --> K["harness.compare(a, b)"]
 ```
 
 ## Setup
@@ -158,6 +161,36 @@ harness.trace(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15, result=res[0])
 `scenes.generate(seed)` makes the scene of one exact seed and raises `SceneError` on the few seeds whose parts
 cannot be placed; `scenes.draw_index(seed, index)` (and `draw_scene(seed0)`) try the next seeds as the round does.
 
+A remote expert (one connection, many scenes in flight) is an object with `send(msg)` and `recv()` (plain or
+async) wrapped around, for example, a WebSocket:
+
+```python
+class Channel:
+    async def send(self, msg: dict) -> None: ...   # raise harness.ChannelClosed when the peer is gone
+    async def recv(self) -> dict: ...              # any message of any scene; raise harness.ChannelClosed when
+                                                   # the peer is gone, harness.Reconnected when a new connection
+                                                   # replaced it (scenes in flight start again)
+
+res = await harness.arun({"remote": Channel()}, scene_list, time_limit_s=15, wall_s=45, workers=8,
+                         step_deadline_s=2.0, max_restarts=2, on_result=cb)   # cb(i, r), plain or async
+res = harness.run({"remote": Channel()}, scene_list, ...)                      # no event loop running here
+res = harness.run({"remote": Channel(), "loop": loop}, scene_list, ...)        # from a thread; loop owns the channel
+harness.compare(res, harness.run({"image": ref}, scene_list[:100], time_limit_s=15, wall_s=45))
+```
+
+`workers` scenes run at once, each with its own simulator. The harness adds `scene_key` (`"<index>.<restart>"`) to
+every message it sends and routes what comes back by it; messages with an unknown key are dropped. Each wait for an
+`act` has the step deadline (`harness.remote.step_deadline_s`, 2 s; the simulator is paused while it waits) and the
+scene's wall budget (`wall_s`, counted from the scene's setup) as caps. On `Reconnected` every scene in flight starts
+again from tick 0 with a new key, at most `max_restarts` times (`harness.remote.max_restarts`, 2); results carry
+`scene_key` and `restarts`. Any other exception from the channel is `harness_error`.
+
+`harness.compare(results_a, results_b)` pairs the results by `scene_id` (by position when ids are missing or
+repeated) and returns `{compared, equal, all_equal, mismatched, infra, only_a, only_b, scenes: [{scene_id, equal,
+a, b, outcome_a, outcome_b, infra}]}`. A scene is equal when both action hashes are there and the same; `infra`
+counts unequal scenes where a side has an infra outcome (re-run those). `harness.action_hash(rows)` hashes rows the
+same way in Python.
+
 For images: `harness.run(..., pull=True)` pulls a missing image first; `harness.ensure_image(image)`,
 `harness.pull(image)` (always pulls, raising `PullFailed`, `ImageTooLarge` or `DockerUnavailable`, all
 `HarnessError` with an `outcome`), `harness.image_size(image)` (bytes on this machine, `None` when absent),
@@ -173,6 +206,8 @@ Every result has `outcome` and `infra`. The pick rules give `success`, `missed`,
 |---|---|---|
 | `expert_error` | no | the expert broke the protocol, gave up, exited, or the container exited after it was created |
 | `wall_timeout` | no | no verdict within the scene's wall budget |
+| `step_timeout` | no | remote: no `act` within the step deadline |
+| `disconnected` | no | remote: the channel closed, or it reconnected with no restarts left |
 | `image_too_large` | no | the image's manifest (compressed) is above `harness.docker.max_image_gb`, or the pulled image is above `max_unpacked_gb` (it is removed again) |
 | `docker_unavailable` | yes | no docker binary, or the daemon does not answer |
 | `image_missing` | yes | the image is not on this machine and `pull` was not asked for |
@@ -216,6 +251,19 @@ One JSON object per line on the expert's stdin and stdout.
 -> {"type":"end","outcome","t","tick"}
 ```
 
+- Remote experts get the same messages with a `"scene_key"` field and answer with it (`{"type":"act","scene_key",
+  "rows"}`, `{"type":"error","scene_key","error"}`). Scenes ended by the harness (`step_timeout`, `wall_timeout`,
+  `expert_error`) still get `{"type":"end","scene_key","outcome","t","tick","error"}`. At most 4 messages of one
+  scene may wait unanswered.
+- **Determinism is required.** The same scene and the same messages must give the same rows, every run, on any
+  machine: seed any randomness from the scene (`scene_id`, `checkpoint`), no clocks, no threads racing on results.
+  Runs of one expert are checked against each other with the action hash.
+- **Action hash.** Every result has `action_hash` and `rows_sent`: FNV-1a 64-bit (offset basis
+  `0xcbf29ce484222325`, prime `0x100000001b3`) over the bytes of every value of every row the expert sent, in the
+  order sent, each value as an IEEE-754 float64 in little-endian order with `-0` written as `0`; acts and their
+  borders are not hashed, an empty act adds nothing, and rows after the verdict in the last act count. Lowercase
+  hex, 16 digits; no rows gives `cbf29ce484222325`. Results the expert never ran for (image or docker problems, harness crashes)
+  have `action_hash: null`.
 - A row is 6 arm joint targets (rad) and the grip, 0 (open) to 1 (closed); one row per tick of 1/20 s.
 - `rows: []` holds the last row until the rules decide. `"obs": true` adds an image to the next state.
 - `{"type":"error","error":"..."}` gives up. Anything else on stdout ends the scene as `expert_error`.

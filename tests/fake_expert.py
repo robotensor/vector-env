@@ -4,6 +4,8 @@ import sys
 import time
 from pathlib import Path
 
+from policy import track
+
 mode = sys.argv[1] if len(sys.argv) > 1 else "hold"
 per = int(sys.argv[2]) if len(sys.argv) > 2 and mode != "sleep" else 1
 q = None
@@ -56,7 +58,9 @@ for line in sys.stdin:
             continue
     if mode == "obs" and m["type"] == "state" and not asked:
         sys.exit(0 if "obs" in m and m["obs"]["depth"] else 4)
-    if mode == "empty":
+    if mode == "track":
+        send({"type": "act", "rows": track(m, arm, per)})
+    elif mode == "empty":
         send({"type": "act", "rows": []})
     elif mode == "obs":
         asked = asked or m["type"] == "state"

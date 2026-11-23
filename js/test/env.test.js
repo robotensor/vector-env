@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT } from '../src/index.js';
+import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT, Session, actionHash, EMPTY_ACTION_HASH } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
@@ -127,6 +127,39 @@ test('a trace replays the rows tick by tick and agrees with replay', { skip: SKI
   assert.equal(none.held, 20);
   assert.ok(none.ticks.slice(1).every((x) => x.after_rows));
   assert.throws(() => traceCtrl(cell, sc, r.ctrl, r.n + 1, 2), /not n =/);
+});
+
+test('the action hash is FNV-1a 64 over little-endian float64 rows', () => {
+  assert.equal(EMPTY_ACTION_HASH, 'cbf29ce484222325');
+  assert.equal(actionHash([]), EMPTY_ACTION_HASH);
+  assert.equal(actionHash([[0, 1, 2, 3, 4, 5, 0.5]]), actionHash([[-0, 1, 2, 3, 4, 5, 0.5]]));
+  assert.notEqual(actionHash([[0, 1, 2, 3, 4, 5, 0.5]]), actionHash([[0, 1, 2, 3, 4, 5, 0.25]]));
+  assert.equal(actionHash([[1, 2], [3]]), actionHash([[1], [2, 3]]));
+  assert.equal(actionHash([[0, -1.5, 1.5, -1.5, -1.5, -0, 1]]), '6834ebbc8b4f0b58');
+});
+
+test('a session steps acts given one by one, like a run', { skip: SKIP }, async () => {
+  const sc = scene();
+  const r = await runJob(cells, { scene: sc, expert: fake('hold'), time_limit_s: 2, wall_s: 30 });
+  const ss = new Session(cells, { scene: sc, time_limit_s: 2 });
+  const { start } = ss.open();
+  const q = [...sc.meta.robot.arm_joints_qpos.map((i) => start.qpos[i]), 0];
+  let out, k = 0;
+  do { out = ss.act({ type: 'act', rows: [q] }, 1); k++; } while (out.state);
+  assert.equal(k, 40);
+  assert.deepEqual([out.end.outcome, out.end.tick], ['timed_out', 40]);
+  assert.deepEqual([out.result.outcome, out.result.ctrl, out.result.action_hash, out.result.rows_sent],
+                   [r.outcome, r.ctrl, r.action_hash, 40]);
+  assert.equal(r.action_hash, actionHash(Array(40).fill(q)));
+  const bad = new Session(cells, { scene: sc, time_limit_s: 2 });
+  bad.open();
+  bad.act({ type: 'act', rows: [q, q] });
+  const e = bad.act({ type: 'act', rows: [[1, 2]] });
+  assert.deepEqual([e.result.outcome, e.result.rows_sent, e.result.n], ['expert_error', 2, 2]);
+  const late = new Session(cells, { scene: sc, time_limit_s: 2 });
+  late.open();
+  const s = late.stop('step_timeout', 'late');
+  assert.deepEqual([s.outcome, s.action_hash, s.n], ['step_timeout', EMPTY_ACTION_HASH, 0]);
 });
 
 test('matQuat turns a rotation matrix into w, x, y, z', () => {

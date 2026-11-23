@@ -5,7 +5,7 @@ import math
 from .settings import cell_config, env_config
 
 OUTCOMES = ("success", "missed", "slipped", "knocked_out", "timed_out", "wrong_part")
-EXPERT_OUTCOMES = ("expert_error", "wall_timeout", "image_too_large")
+EXPERT_OUTCOMES = ("expert_error", "wall_timeout", "step_timeout", "disconnected", "image_too_large")
 INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed")
 HARNESS_OUTCOMES = EXPERT_OUTCOMES + INFRA_OUTCOMES
 

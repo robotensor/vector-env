@@ -126,8 +126,10 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 class ProtocolError extends Error {}
 
 function parseAct(line, maxRows) {
-  let m;
-  try { m = JSON.parse(line); } catch { throw new ProtocolError(`not JSON: ${line.slice(0, 120)}`); }
+  let m = line;
+  if (typeof line === 'string') {
+    try { m = JSON.parse(line); } catch { throw new ProtocolError(`not JSON: ${line.slice(0, 120)}`); }
+  }
   if (!m || typeof m !== 'object') throw new ProtocolError('a message must be a JSON object');
   if (m.type === 'error') throw new ProtocolError(`the expert gave up: ${String(m.error || '').slice(0, 300)}`);
   if (m.type !== 'act') throw new ProtocolError(`expected an act message, got ${JSON.stringify(m.type)}`);
@@ -148,114 +150,198 @@ function stats(xs) {
            max_ms: round(s[s.length - 1], 4) };
 }
 
-export async function runJob(cells, job) {
-  const t0 = performance.now();
-  const wallS = Number(job.wall_s) > 0 ? Number(job.wall_s) : 45;
-  const graceS = Number(job.grace_s) >= 0 ? Number(job.grace_s) : 2;
-  const sc = job.scene || {};
-  const res = { scene_id: sc.scene_id ?? null, outcome: null, success: false, t: 0, tick: 0, ctrl: '', n: 0, wall_s: 0,
-                error: null, exchanges: 0 };
-  const done = (outcome, error = null) => {
+const FNV_OFFSET = 0xcbf29ce484222325n;
+const FNV_PRIME = 0x100000001b3n;
+const M64 = (1n << 64n) - 1n;
+export const EMPTY_ACTION_HASH = FNV_OFFSET.toString(16).padStart(16, '0');
+
+export class ActionHash {
+  constructor() { this.h = FNV_OFFSET; this.rows = 0; this.view = new DataView(new ArrayBuffer(8)); }
+
+  add(rows) {
+    const v = this.view;
+    let h = this.h;
+    for (const r of rows) {
+      for (const x of r) {
+        v.setFloat64(0, x === 0 ? 0 : x, true);
+        for (let k = 0; k < 8; k++) h = ((h ^ BigInt(v.getUint8(k))) * FNV_PRIME) & M64;
+      }
+      this.rows++;
+    }
+    this.h = h;
+    return this;
+  }
+
+  hex() { return this.h.toString(16).padStart(16, '0'); }
+}
+
+export function actionHash(rows) { return new ActionHash().add(rows).hex(); }
+
+export class Session {
+  constructor(cells, job) {
+    this.job = job;
+    this.t0 = performance.now();
+    this.sc = job.scene || {};
+    this.res = { scene_id: this.sc.scene_id ?? null, outcome: null, success: false, t: 0, tick: 0, ctrl: '', n: 0, wall_s: 0,
+                 error: null, exchanges: 0, action_hash: EMPTY_ACTION_HASH, rows_sent: 0 };
+    this.hash = new ActionHash();
+    this.wait = [];
+    this.sim = [];
+    this.verdict = null;
+    this.ended = false;
+    this.cells = cells;
+  }
+
+  _done(outcome, error = null) {
+    const res = this.res;
     res.outcome = outcome;
     res.success = outcome === 'success';
     res.error = error;
     res.infra = INFRA_OUTCOMES.includes(outcome);
-    res.wall_s = round((performance.now() - t0) / 1000, 3);
+    res.wall_s = round((performance.now() - this.t0) / 1000, 3);
+    res.action_hash = this.hash.hex();
+    res.rows_sent = this.hash.rows;
+    this.ended = true;
+    this.close();
     return res;
-  };
-  const tail = (ex) => { const t = ex.stderr.trim().split('\n').slice(-5).join(' | '); return t ? ': ' + t : ''; };
-  const cid = job.expert && job.expert.cidfile;
-  const neverStarted = () => !!cid && res.exchanges === 0 && !fs.existsSync(cid);
-  let cell, ep;
-  try {
-    cell = cells.get(sc);
-    setLimit(cell, job.time_limit_s);
-    ep = restore(cell, sc);
-  } catch (e) {
-    return done('scene_error', String(e.message || e));
   }
-  const lim = limits(cell);
-  const tickS = cell.meta.tick_s;
-  const start = { type: 'start', format: FORMAT, scene: { scene_id: sc.scene_id ?? null, xml: sc.xml, meta: sc.meta },
-                  checkpoint: sc.checkpoint, state_hash: sc.state_hash, target: sc.target,
-                  tick: 0, t: 0, ...physState(cell), obs: observation(cell, { rgb: job.rgb !== false }), limits: lim };
-  res.setup_s = round((performance.now() - t0) / 1000, 3);
-  const ex = new Expert(job.expert.argv, job.expert.env, job.expert.cwd, job.io, job.expert.stderr_file);
-  let timedOut = false;
-  const wallMs = Math.max(0, 1000 * wallS - (performance.now() - t0));
-  let timer;
-  const wall = new Promise((r) => { timer = setTimeout(() => { timedOut = true; r(null); }, wallMs); });
-  const wait = [], sim = [];
-  let verdict = null;
-  const ticksSoFar = () => (ep.cur ? ep.cur.ticks : ep.lastTry ? ep.lastTry.ticks : 0);
-  const ctrlSoFar = () => {
+
+  open() {
+    const sc = this.sc, job = this.job;
+    try {
+      this.cell = this.cells.get(sc);
+      setLimit(this.cell, job.time_limit_s);
+      this.ep = restore(this.cell, sc);
+    } catch (e) {
+      return { result: this._done('scene_error', String(e.message || e)) };
+    }
+    const cell = this.cell;
+    this.lim = limits(cell);
+    this.tickS = cell.meta.tick_s;
+    const start = { type: 'start', format: FORMAT, scene: { scene_id: sc.scene_id ?? null, xml: sc.xml, meta: sc.meta },
+                    checkpoint: sc.checkpoint, state_hash: sc.state_hash, target: sc.target,
+                    tick: 0, t: 0, ...physState(cell), obs: observation(cell, { rgb: job.rgb !== false }), limits: this.lim };
+    this.res.setup_s = round((performance.now() - this.t0) / 1000, 3);
+    this.ep.beginTry(sc.target);
+    return { start };
+  }
+
+  elapsedS() { return (performance.now() - this.t0) / 1000; }
+
+  _ctrlSoFar() {
+    const ep = this.ep, res = this.res;
+    if (!ep) return;
     if (ep.lastTry) { res.ctrl = ep.lastTry.seg.ctrl; res.n = ep.lastTry.ticks; }
     else if (ep.cur) { res.n = ep.cur.ticks; res.ctrl = Buffer.from(Float64Array.from(ep.cur.ctrl).buffer).toString('base64'); }
-    res.tick = ticksSoFar();
-    res.t = round(res.tick * tickS);
-  };
+    res.tick = ep.cur ? ep.cur.ticks : ep.lastTry ? ep.lastTry.ticks : 0;
+    res.t = round(res.tick * this.tickS);
+  }
+
+  act(msg, waitMs) {
+    if (this.ended) throw new Error('the session has ended');
+    const ep = this.ep, cell = this.cell;
+    if (Number.isFinite(waitMs)) this.wait.push(waitMs);
+    this.res.exchanges++;
+    let act;
+    try {
+      act = parseAct(msg, this.lim.max_rows - ep.cur.ticks);
+    } catch (e) {
+      if (e instanceof ProtocolError) return { result: this.stop('expert_error', e.message) };
+      throw e;
+    }
+    this.hash.add(act.rows);
+    const s0 = performance.now();
+    let verdict = null;
+    if (act.rows.length === 0) {
+      let row = ep.cur.ctrl.length ? ep.cur.ctrl.slice(-CTRL) : null;
+      if (!row) { row = cell.ctrl().slice(); row[6] = 0; }
+      while (!verdict) verdict = ep.stepTry(row);
+    } else {
+      for (const row of act.rows) { verdict = ep.stepTry(row); if (verdict) break; }
+    }
+    if (!verdict) {
+      const state = { type: 'state', tick: ep.cur.ticks, t: round(ep.cur.ticks * this.tickS), ...physState(cell) };
+      if (act.obs) state.obs = observation(cell, { rgb: this.job.rgb !== false });
+      this.sim.push(performance.now() - s0);
+      return { state };
+    }
+    this.sim.push(performance.now() - s0);
+    this._ctrlSoFar();
+    const tick = ep.lastTry.verdict.tick;
+    const end = { type: 'end', outcome: verdict.outcome, t: round(tick * this.tickS), tick };
+    this.res.detail = verdict.detail;
+    this._stats();
+    return { end, result: this._done(verdict.outcome) };
+  }
+
+  _stats() {
+    this.res.exchange = stats(this.wait);
+    this.res.sim_ms = round(this.sim.reduce((a, b) => a + b, 0), 3);
+  }
+
+  stop(outcome, error = null) {
+    if (this.ended) return this.res;
+    this._ctrlSoFar();
+    this._stats();
+    return this._done(outcome, error);
+  }
+
+  close() {
+    if (this.ep && this.ep.cur) this.ep.abortTry();
+  }
+}
+
+export async function runJob(cells, job) {
+  const wallS = Number(job.wall_s) > 0 ? Number(job.wall_s) : 45;
+  const graceS = Number(job.grace_s) >= 0 ? Number(job.grace_s) : 2;
+  const ss = new Session(cells, job);
+  const tail = (ex) => { const t = ex.stderr.trim().split('\n').slice(-5).join(' | '); return t ? ': ' + t : ''; };
+  const cid = job.expert && job.expert.cidfile;
+  const neverStarted = () => !!cid && ss.res.exchanges === 0 && !fs.existsSync(cid);
+  const opened = ss.open();
+  if (opened.result) return opened.result;
+  const ex = new Expert(job.expert.argv, job.expert.env, job.expert.cwd, job.io, job.expert.stderr_file);
+  let timedOut = false;
+  const wallMs = Math.max(0, 1000 * (wallS - ss.elapsedS()));
+  let timer;
+  const wall = new Promise((r) => { timer = setTimeout(() => { timedOut = true; r(null); }, wallMs); });
   try {
-    ep.beginTry(sc.target);
-    ex.send(start);
+    ex.send(opened.start);
     let sent = performance.now();
     for (;;) {
       const line = await Promise.race([ex.next(), wall]);
       const got = performance.now();
       if (timedOut) {
-        ctrlSoFar();
         await ex.kill(job.expert.kill);
-        if (neverStarted()) return done('start_failed', `the container did not start within ${wallS} s${tail(ex)}`);
-        return done('wall_timeout', `no verdict within the wall budget of ${wallS} s`);
+        if (neverStarted()) return ss.stop('start_failed', `the container did not start within ${wallS} s${tail(ex)}`);
+        return ss.stop('wall_timeout', `no verdict within the wall budget of ${wallS} s`);
       }
       if (line === null) {
-        ctrlSoFar();
         await ex.kill(job.expert.kill);
-        if (ex.broken) return done('expert_error', ex.broken);
-        if (ex.spawnError) return done(job.expert.docker ? 'docker_unavailable' : 'start_failed', `could not start the expert: ${ex.spawnError}`);
-        if (neverStarted()) return done('start_failed', `the container was not created (docker exited ${ex.exit})${tail(ex)}`);
-        return done('expert_error', `the expert exited (${ex.exit})${tail(ex)}`);
+        if (ex.broken) return ss.stop('expert_error', ex.broken);
+        if (ex.spawnError) return ss.stop(job.expert.docker ? 'docker_unavailable' : 'start_failed', `could not start the expert: ${ex.spawnError}`);
+        if (neverStarted()) return ss.stop('start_failed', `the container was not created (docker exited ${ex.exit})${tail(ex)}`);
+        return ss.stop('expert_error', `the expert exited (${ex.exit})${tail(ex)}`);
       }
-      wait.push(got - sent);
-      res.exchanges++;
-      const act = parseAct(line, lim.max_rows - ep.cur.ticks);
-      const s0 = performance.now();
-      if (act.rows.length === 0) {
-        let row = ep.cur.ctrl.length ? ep.cur.ctrl.slice(-CTRL) : null;
-        if (!row) { row = cell.ctrl().slice(); row[6] = 0; }
-        while (!verdict) verdict = ep.stepTry(row);
-      } else {
-        for (const row of act.rows) { verdict = ep.stepTry(row); if (verdict) break; }
+      const out = ss.act(line, got - sent);
+      if (out.state) {
+        sent = performance.now();
+        ex.send(out.state);
+        continue;
       }
-      if (verdict) { sim.push(performance.now() - s0); break; }
-      const msg = { type: 'state', tick: ep.cur.ticks, t: round(ep.cur.ticks * tickS), ...physState(cell) };
-      if (act.obs) msg.obs = observation(cell, { rgb: job.rgb !== false });
-      sim.push(performance.now() - s0);
-      sent = performance.now();
-      if (!ex.send(msg)) continue;
+      clearTimeout(timer);
+      if (!out.end) { await ex.kill(job.expert.kill); return out.result; }
+      ex.send(out.end);
+      await ex.finish(graceS, job.expert.kill);
+      return out.result;
     }
-    clearTimeout(timer);
-    ctrlSoFar();
-    const tick = ep.lastTry.verdict.tick;
-    ex.send({ type: 'end', outcome: verdict.outcome, t: round(tick * tickS), tick });
-    res.wall_s = round((performance.now() - t0) / 1000, 3);
-    res.detail = verdict.detail;
-    res.exchange = stats(wait);
-    res.sim_ms = round(sim.reduce((a, b) => a + b, 0), 3);
-    await ex.finish(graceS, job.expert.kill);
-    const wallS2 = res.wall_s;
-    done(verdict.outcome);
-    res.wall_s = wallS2;
-    return res;
   } catch (e) {
     clearTimeout(timer);
-    ctrlSoFar();
-    res.exchange = stats(wait);
     await ex.kill(job.expert.kill);
-    if (e instanceof ProtocolError) return done('expert_error', e.message);
-    return done('harness_error', String(e.stack || e.message || e).slice(0, 500));
+    return ss.stop('harness_error', String(e.stack || e.message || e).slice(0, 500));
   } finally {
     clearTimeout(timer);
-    if (ep && ep.cur) ep.abortTry();
+    ss.close();
   }
 }
 

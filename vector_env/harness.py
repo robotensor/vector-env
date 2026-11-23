@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import platform
 import queue
 import shlex
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -18,6 +21,9 @@ from .rules import HARNESS_OUTCOMES, INFRA_OUTCOMES
 from .settings import env_config
 
 GB = 1 << 30
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+EMPTY_ACTION_HASH = f"{FNV_OFFSET:016x}"
 
 
 class HarnessError(RuntimeError):
@@ -42,6 +48,22 @@ class ImageTooLarge(HarnessError):
 
 class ReplayMismatch(HarnessError):
     outcome = "replay_mismatch"
+
+
+class ChannelClosed(Exception):
+    pass
+
+
+class Reconnected(Exception):
+    pass
+
+
+def action_hash(rows) -> str:
+    h = FNV_OFFSET
+    for r in rows:
+        for b in struct.pack(f"<{len(r)}d", *(float(x) + 0.0 for x in r)):
+            h = ((h ^ b) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
 
 
 def docker_defaults() -> dict:
@@ -247,12 +269,24 @@ def _wire(scene: dict) -> dict:
 
 def _fail(scene: dict, outcome: str, error: str, wall: float) -> dict:
     return {"scene_id": scene.get("scene_id"), "outcome": outcome, "success": False, "t": 0.0, "ctrl": "", "n": 0,
-            "wall_s": round(wall, 3), "error": error, "infra": outcome in INFRA_OUTCOMES}
+            "wall_s": round(wall, 3), "error": error, "infra": outcome in INFRA_OUTCOMES, "action_hash": None}
 
 
 def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
         docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
-        stderr_dir: str | Path | None = None) -> list[dict]:
+        stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
+        max_restarts: int | None = None) -> list[dict]:
+    if expert.get("remote") is not None:
+        coro = arun(expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers, io=io,
+                    on_result=on_result, step_deadline_s=step_deadline_s, max_restarts=max_restarts)
+        if expert.get("loop") is not None:
+            return asyncio.run_coroutine_threadsafe(coro, expert["loop"]).result()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        coro.close()
+        raise RuntimeError("harness.run was called inside a running event loop: use await harness.arun(...)")
     bad = prepare(expert, docker, pull)
     if bad is not None:
         out = [_fail(sc, bad[0], bad[1], 0.0) for sc in scenes]
@@ -376,3 +410,218 @@ def summary(results: list[dict]) -> dict:
             "mean_wall_s": round(sum(r.get("wall_s") or 0 for r in results) / n, 3) if n else None,
             "exchanges": tot,
             "exchange_mean_ms": round(sum(e["mean_ms"] * e["n"] for e in ex) / tot, 4) if tot else None}
+
+
+async def _maybe(x):
+    return await x if inspect.isawaitable(x) else x
+
+
+_CLOSED, _RESTART = object(), object()
+
+
+class _Box:
+    def __init__(self) -> None:
+        self.q: asyncio.Queue = asyncio.Queue()
+        self.flood = False
+
+
+class _Mux:
+    def __init__(self, channel, max_queued: int):
+        self.ch = channel
+        self.max_queued = max_queued
+        self.boxes: dict[str, _Box] = {}
+        self.closed: tuple[str, str] | None = None
+        self.dropped = 0
+
+    def open(self, key: str) -> _Box:
+        b = self.boxes[key] = _Box()
+        if self.closed:
+            b.q.put_nowait((_CLOSED, 0.0))
+        return b
+
+    def drop(self, key: str) -> None:
+        self.boxes.pop(key, None)
+
+    async def send(self, msg: dict) -> None:
+        if self.closed:
+            raise ChannelClosed(self.closed[1])
+        await _maybe(self.ch.send(msg))
+
+    def _close(self, outcome: str, why: str) -> None:
+        self.closed = (outcome, why)
+        for b in list(self.boxes.values()):
+            b.q.put_nowait((_CLOSED, 0.0))
+
+    async def reader(self) -> None:
+        while True:
+            try:
+                m = await _maybe(self.ch.recv())
+            except Reconnected:
+                for b in list(self.boxes.values()):
+                    b.q.put_nowait((_RESTART, 0.0))
+                continue
+            except ChannelClosed as e:
+                return self._close("disconnected", f"the connection closed: {e}" if str(e) else "the connection closed")
+            except Exception as e:
+                return self._close("harness_error", f"the channel failed: {type(e).__name__}: {e}"[:500])
+            key = m.get("scene_key") if isinstance(m, dict) else None
+            b = self.boxes.get(key) if isinstance(key, str) else None
+            if b is None:
+                self.dropped += 1
+                continue
+            if b.q.qsize() >= self.max_queued:
+                b.flood = True
+                continue
+            b.q.put_nowait((m, time.monotonic()))
+
+
+async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
+               docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
+               stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
+               max_restarts: int | None = None) -> list[dict]:
+    if expert.get("remote") is None:
+        return await asyncio.to_thread(run, expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers,
+                                       docker=docker, io=io, on_result=on_result, pull=pull, stderr_dir=stderr_dir)
+    H = env_config()["harness"]
+    R = H.get("remote") or {}
+    deadline = float(step_deadline_s if step_deadline_s is not None else R.get("step_deadline_s", 2.0))
+    restarts = int(max_restarts if max_restarts is not None else R.get("max_restarts", 2))
+    queued = int({**(H.get("io") or {}), **(io or {})}.get("max_queued") or 4)
+    bundle = assets.ensure()
+    mux = _Mux(expert["remote"], queued)
+    out: list[dict | None] = [None] * len(scenes)
+    todo = iter(range(len(scenes)))
+    reader = asyncio.ensure_future(mux.reader())
+    procs: list[NodeProc] = []
+
+    async def worker() -> None:
+        proc = NodeProc("harness.mjs", bundle)
+        procs.append(proc)
+        for i in todo:
+            sc = scenes[i]
+            n = 0
+            while True:
+                key = f"{i}.{n}"
+                r, again = await _remote_scene(proc, mux, sc, key, time_limit_s=float(time_limit_s),
+                                               wall_s=float(wall_s), deadline=deadline, last=n >= restarts)
+                if not again:
+                    break
+                n += 1
+            r["scene_key"], r["restarts"] = key, n
+            if r.get("scene_id") is None:
+                r["scene_id"] = sc.get("scene_id")
+            r["infra"] = r.get("outcome") in INFRA_OUTCOMES
+            out[i] = r
+            if on_result:
+                await _maybe(on_result(i, r))
+
+    try:
+        await asyncio.gather(*(worker() for _ in range(max(1, min(int(workers), len(scenes) or 1)))))
+    finally:
+        reader.cancel()
+        try:
+            await reader
+        except (asyncio.CancelledError, Exception):
+            pass
+        for p in procs:
+            await asyncio.to_thread(p.close)
+    return [r if r is not None else _fail(scenes[i], "harness_error", "not run", 0.0) for i, r in enumerate(out)]
+
+
+async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_limit_s: float, wall_s: float,
+                        deadline: float, last: bool) -> tuple[dict, bool]:
+    call = lambda m: asyncio.to_thread(proc.call, m, wall_s + 120)
+    box = mux.open(key)
+    t0 = time.monotonic()
+
+    async def stop(outcome: str, error: str, notify: bool = True) -> dict:
+        r = (await call({"op": "stop", "outcome": outcome, "error": error}))["result"]
+        r.pop("id", None)
+        if notify:
+            await _notify(r)
+        return r
+
+    async def _notify(r: dict) -> None:
+        try:
+            await mux.send({"type": "end", "scene_key": key, "outcome": r.get("outcome"), "t": r.get("t"),
+                            "tick": r.get("tick"), "error": r.get("error")})
+        except Exception:
+            pass
+
+    try:
+        got = await call({"op": "open", "scene": _wire(sc), "time_limit_s": time_limit_s})
+        if "result" in got:
+            return got["result"], False
+        msg = got["start"]
+        while True:
+            try:
+                await mux.send({**msg, "scene_key": key})
+            except ChannelClosed as e:
+                outcome, why = mux.closed or ("disconnected", f"the connection closed: {e}" if str(e) else
+                                              "the connection closed")
+                return await stop(outcome, why, False), False
+            sent = time.monotonic()
+            left = wall_s - (sent - t0)
+            wait = min(deadline, left)
+            try:
+                if wait <= 0:
+                    raise asyncio.TimeoutError
+                item, at = await asyncio.wait_for(box.q.get(), wait)
+            except asyncio.TimeoutError:
+                if deadline < left:
+                    return await stop("step_timeout", f"no act within the step deadline of {deadline:g} s "
+                                                      f"(tick {msg.get('tick')})"), False
+                return await stop("wall_timeout", f"no verdict within the wall budget of {wall_s:g} s"), False
+            if item is _RESTART:
+                if last:
+                    return await stop("disconnected", "the connection was replaced while the scene ran, "
+                                                      "and the scene has no restarts left", False), False
+                await stop("disconnected", "restarted after a reconnect", False)
+                return {}, True
+            if item is _CLOSED:
+                outcome, why = mux.closed or ("disconnected", "the connection closed")
+                return await stop(outcome, why, False), False
+            if box.flood:
+                return await stop("expert_error", f"the expert sent more than {mux.max_queued} messages without "
+                                                  "waiting for a state"), False
+            got = await call({"op": "act", "act": item, "wait_ms": max(0.0, (at - sent) * 1000)})
+            if "state" in got:
+                msg = got["state"]
+                continue
+            r = got["result"]
+            r.pop("id", None)
+            if "end" in got:
+                try:
+                    await mux.send({**got["end"], "scene_key": key})
+                except Exception:
+                    pass
+            else:
+                await _notify(r)
+            return r, False
+    except Exception as e:
+        await asyncio.to_thread(proc.close)
+        return _fail(sc, "harness_error", f"{type(e).__name__}: {e}"[:500], time.monotonic() - t0), False
+    finally:
+        mux.drop(key)
+
+
+def compare(results_a: list[dict], results_b: list[dict]) -> dict:
+    ids = lambda rs: [r.get("scene_id") for r in rs]
+    by_id = all(None not in ids(rs) and len(set(ids(rs))) == len(rs) for rs in (results_a, results_b))
+    if not by_id and len(results_a) != len(results_b):
+        raise ValueError("scene ids are missing or repeated, so the results are paired by position, "
+                         "and the two lists differ in length")
+    keys = (lambda rs: ids(rs)) if by_id else (lambda rs: list(range(len(rs))))
+    A, B = dict(zip(keys(results_a), results_a)), dict(zip(keys(results_b), results_b))
+    rows = []
+    for k in [k for k in keys(results_a) if k in B]:
+        a, b = A[k], B[k]
+        ha, hb = a.get("action_hash"), b.get("action_hash")
+        rows.append({"scene_id": a.get("scene_id"), "equal": ha is not None and ha == hb, "a": ha, "b": hb,
+                     "outcome_a": a.get("outcome"), "outcome_b": b.get("outcome"),
+                     "infra": bool(a.get("outcome") in INFRA_OUTCOMES or b.get("outcome") in INFRA_OUTCOMES)})
+    bad = [x for x in rows if not x["equal"]]
+    return {"compared": len(rows), "equal": len(rows) - len(bad), "all_equal": bool(rows) and not bad,
+            "mismatched": [x["scene_id"] for x in bad], "infra": sum(1 for x in bad if x["infra"]),
+            "only_a": [k for k in keys(results_a) if k not in B], "only_b": [k for k in keys(results_b) if k not in A],
+            "scenes": rows}
