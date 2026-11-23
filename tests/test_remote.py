@@ -154,3 +154,86 @@ def test_compare_pairs_by_position_without_ids():
     assert (c["compared"], c["equal"], c["infra"], c["all_equal"]) == (2, 1, 1, False)
     with pytest.raises(ValueError):
         harness.compare(a, a[:1])
+
+
+class RawMiner:
+    def __init__(self, raw):
+        self.raw, self.q, self.sent = raw, None, []
+
+    def paused(self):
+        return False
+
+    async def send(self, msg):
+        import json
+        self.q = self.q or asyncio.Queue()
+        self.sent.append(msg["type"])
+        if msg["type"] in ("start", "state"):
+            text = self.raw.replace("KEY", msg["scene_key"])
+            await self.q.put(json.loads(text))
+
+    async def recv(self):
+        self.q = self.q or asyncio.Queue()
+        return await self.q.get()
+
+
+@pytest.mark.parametrize("raw,match", [
+    ('{"type":"act","scene_key":"KEY","rows":[[NaN,0,0,0,0,0,0]]}', "not a finite number"),
+    ('{"type":"act","scene_key":"KEY","rows":[[Infinity,0,0,0,0,0,0]]}', "not a finite number"),
+    ('{"type":"act","scene_key":"KEY","rows":[[1e999,0,0,0,0,0,0]]}', "not a finite number"),
+    ('{"type":"act","scene_key":"KEY","rows":[[0,0,0,0,0,0,1e300]]}', "outside -100..100"),
+    ('{"type":"act","scene_key":"KEY","rows":[[0,0,0,0,0,"x",0]]}', "is not a number"),
+    ('{"type":"act","scene_key":"KEY","rows":[[0,0,0,0,0,true,0]]}', "is not a number"),
+    ('{"type":"act","scene_key":"KEY","rows":[[0,0,0]]}', "not a row of 7 numbers"),
+    ('{"type":"act","scene_key":"KEY","rows":{}}', "must be a list of rows"),
+    ('{"type":"invalid","scene_key":"KEY","error":"the server refused it"}', "the server refused it"),
+])
+def test_a_bad_act_is_the_experts_error_not_ours(scene, raw, match):
+    m = RawMiner(raw)
+    r = remote(m, [scene])[0]
+    assert r["outcome"] == "expert_error" and not r["infra"] and match in r["error"], r
+    assert m.sent == ["start", "end"]
+
+
+def test_an_act_the_simulator_rejects_is_the_experts_error(scene, monkeypatch):
+    from vector_env import node
+    real = node.NodeProc.call
+
+    def call(self, msg, timeout=None):
+        if msg.get("op") == "act":
+            raise node.SimError("RangeError: boom")
+        return real(self, msg, timeout)
+    monkeypatch.setattr(node.NodeProc, "call", call)
+    r = remote(FakeMiner(), [scene])[0]
+    assert r["outcome"] == "expert_error" and not r["infra"] and "RangeError: boom" in r["error"], r
+
+
+def test_our_simulator_crashing_stays_infrastructure(scene, monkeypatch):
+    from vector_env import node
+    real = node.NodeProc.call
+
+    def call(self, msg, timeout=None):
+        if msg.get("op") == "act":
+            raise node.SimCrashed("harness.mjs stopped: out of memory")
+        return real(self, msg, timeout)
+    monkeypatch.setattr(node.NodeProc, "call", call)
+    r = remote(FakeMiner(), [scene])[0]
+    assert r["outcome"] == "harness_error" and r["infra"] and "stopped" in r["error"], r
+
+
+def test_python_never_writes_nan_to_node(scene):
+    from vector_env import assets, node
+    p = node.NodeProc("harness.mjs", assets.ensure())
+    try:
+        with pytest.raises(ValueError):
+            p.call({"op": "act", "act": {"type": "act", "rows": [[float("nan")] * 7]}})
+        got = p.call({"op": "open", "scene": harness._wire(scene), "time_limit_s": T})
+        assert "start" in got
+    finally:
+        p.close()
+
+
+def test_restarts_used_carry_over(scenes3):
+    r = remote(FakeMiner(), scenes3[:2], workers=2, restarts_used=[1, 0])
+    assert [x["scene_key"] for x in r] == ["0.1", "1.0"] and [x["restarts"] for x in r] == [1, 0], r
+    r = remote(FakeMiner(reconnect_after=6), scenes3[:1], max_restarts=2, restarts_used=[2])[0]
+    assert r["outcome"] == "disconnected" and "no restarts left" in r["error"] and r["scene_key"] == "0.2", r

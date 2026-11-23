@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 
 from . import assets
-from .node import NodeProc, sim
+from .node import NodeProc, SimCrashed, sim
 from .rules import HARNESS_OUTCOMES, INFRA_OUTCOMES
 from .settings import env_config
 
@@ -275,11 +275,12 @@ def _fail(scene: dict, outcome: str, error: str, wall: float) -> dict:
 def run(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
         docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
         stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
-        max_restarts: int | None = None, first_step_deadline_s: float | None = None) -> list[dict]:
+        max_restarts: int | None = None, first_step_deadline_s: float | None = None,
+        restarts_used: list[int] | None = None) -> list[dict]:
     if expert.get("remote") is not None:
         coro = arun(expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers, io=io,
                     on_result=on_result, step_deadline_s=step_deadline_s, max_restarts=max_restarts,
-                    first_step_deadline_s=first_step_deadline_s)
+                    first_step_deadline_s=first_step_deadline_s, restarts_used=restarts_used)
         if expert.get("loop") is not None:
             return asyncio.run_coroutine_threadsafe(coro, expert["loop"]).result()
         try:
@@ -418,6 +419,31 @@ async def _maybe(x):
 
 
 _CLOSED, _RESTART = object(), object()
+CTRL = 7
+
+
+def act_error(m, max_abs: float | None = None) -> str | None:
+    if not isinstance(m, dict):
+        return "a message must be a JSON object"
+    if m.get("type") == "invalid":
+        return str(m.get("error") or "the act was not valid")[:300]
+    if m.get("type") != "act":
+        return None
+    lim = float(max_abs if max_abs is not None else (env_config()["harness"].get("remote") or {}).get("max_abs", 100.0))
+    rows = m.get("rows")
+    if not isinstance(rows, list):
+        return "act.rows must be a list of rows"
+    for j, r in enumerate(rows):
+        if not isinstance(r, list) or len(r) != CTRL:
+            return f"act.rows[{j}] is not a row of {CTRL} numbers"
+        for k, x in enumerate(r):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                return f"act.rows[{j}][{k}] is not a number"
+            if x != x or x in (float("inf"), float("-inf")):
+                return f"act.rows[{j}][{k}] is not a finite number"
+            if abs(x) > lim:
+                return f"act.rows[{j}][{k}] = {x:g} is outside -{lim:g}..{lim:g}"
+    return None
 
 
 class _Box:
@@ -493,7 +519,8 @@ class _Mux:
 async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s: float, workers: int = 1,
                docker: dict | None = None, io: dict | None = None, on_result=None, pull: bool = False,
                stderr_dir: str | Path | None = None, step_deadline_s: float | None = None,
-               max_restarts: int | None = None, first_step_deadline_s: float | None = None) -> list[dict]:
+               max_restarts: int | None = None, first_step_deadline_s: float | None = None,
+               restarts_used: list[int] | None = None) -> list[dict]:
     if expert.get("remote") is None:
         return await asyncio.to_thread(run, expert, scenes, time_limit_s=time_limit_s, wall_s=wall_s, workers=workers,
                                        docker=docker, io=io, on_result=on_result, pull=pull, stderr_dir=stderr_dir)
@@ -503,6 +530,8 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
     first = float(first_step_deadline_s if first_step_deadline_s is not None else
                   R.get("first_step_deadline_s", max(deadline, 10.0)))
     restarts = int(max_restarts if max_restarts is not None else R.get("max_restarts", 2))
+    max_abs = float(R.get("max_abs", 100.0))
+    used = list(restarts_used or [])
     queued = int({**(H.get("io") or {}), **(io or {})}.get("max_queued") or 4)
     bundle = assets.ensure()
     mux = _Mux(expert["remote"], queued)
@@ -516,12 +545,12 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
         procs.append(proc)
         for i in todo:
             sc = scenes[i]
-            n = 0
+            n = max(0, int(used[i])) if i < len(used) and used[i] else 0
             while True:
                 key = f"{i}.{n}"
                 r, again = await _remote_scene(proc, mux, sc, key, time_limit_s=float(time_limit_s),
                                                wall_s=float(wall_s), deadline=deadline, first=first,
-                                               last=n >= restarts)
+                                               last=n >= restarts, max_abs=max_abs)
                 if not again:
                     break
                 n += 1
@@ -547,7 +576,7 @@ async def arun(expert: dict, scenes: list[dict], *, time_limit_s: float, wall_s:
 
 
 async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_limit_s: float, wall_s: float,
-                        deadline: float, first: float, last: bool) -> tuple[dict, bool]:
+                        deadline: float, first: float, last: bool, max_abs: float = 100.0) -> tuple[dict, bool]:
     call = lambda m: asyncio.to_thread(proc.call, m, wall_s + 120)
     box = mux.open(key)
     t0 = time.monotonic()
@@ -612,7 +641,15 @@ async def _remote_scene(proc: NodeProc, mux: _Mux, sc: dict, key: str, *, time_l
             if box.flood:
                 return await stop("expert_error", f"the expert sent more than {mux.max_queued} messages without "
                                                   "waiting for a state"), False
-            got = await call({"op": "act", "act": item, "wait_ms": max(0.0, (at - sent) * 1000)})
+            why = act_error(item, max_abs)
+            if why:
+                return await stop("expert_error", why), False
+            try:
+                got = await call({"op": "act", "act": item, "wait_ms": max(0.0, (at - sent) * 1000)})
+            except SimCrashed:
+                raise
+            except Exception as e:
+                return await stop("expert_error", f"the act could not be applied: {type(e).__name__}: {e}"[:500]), False
             if "state" in got:
                 msg = got["state"]
                 continue

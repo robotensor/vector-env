@@ -13,6 +13,10 @@ class SimError(RuntimeError):
     pass
 
 
+class SimCrashed(SimError):
+    pass
+
+
 class NodeProc:
     def __init__(self, script: str, bundle: Path, env: dict | None = None):
         self.script = str(js_dir() / "bin" / script)
@@ -40,7 +44,7 @@ class NodeProc:
             if timer:
                 timer.start()
             try:
-                p.stdin.write((json.dumps(msg, separators=(",", ":")) + "\n").encode())
+                p.stdin.write((json.dumps(msg, separators=(",", ":"), allow_nan=False) + "\n").encode())
                 p.stdin.flush()
                 line = p.stdout.readline()
             except (BrokenPipeError, OSError):
@@ -50,7 +54,7 @@ class NodeProc:
                     timer.cancel()
             if not line:
                 self.close()
-                raise SimError(f"{Path(self.script).name} stopped: {''.join(getattr(self, 'err', []))[-800:]}")
+                raise SimCrashed(f"{Path(self.script).name} stopped: {''.join(getattr(self, 'err', []))[-800:]}")
             out = json.loads(line)
             if out.get("error") and set(out) <= {"id", "error", "kind"}:
                 raise SimError(out["error"])
