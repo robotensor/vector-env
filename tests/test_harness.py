@@ -13,7 +13,7 @@ EXAMPLE = {"command": ["node", str(ROOT / "example" / "solve.mjs")]}
 RESULT_KEYS = {"scene_id", "outcome", "success", "t", "ctrl", "n", "wall_s", "error"}
 
 
-def test_example_expert_over_several_scenes(scenes3):
+def test_the_example_expert_runs_over_several_scenes(scenes3):
     seen = []
     res = harness.run(EXAMPLE, scenes3, time_limit_s=15, wall_s=60, workers=2, on_result=lambda i, r: seen.append(i))
     assert sorted(seen) == [0, 1, 2]
@@ -24,7 +24,7 @@ def test_example_expert_over_several_scenes(scenes3):
         rp = harness.replay(sc, r["ctrl"], r["n"], time_limit_s=15)
         assert (rp["outcome"], rp["success"], rp["t"]) == (r["outcome"], r["success"], r["t"])
     s = harness.summary(res)
-    assert s["scenes"] == 3 and s["successes"] >= 2, s
+    assert s["scenes"] == 3 and s["successes"] == sum(r["success"] for r in res), s
 
 
 def test_robot_time_limit_and_pipe_overhead(scene):

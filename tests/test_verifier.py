@@ -1,12 +1,15 @@
 import base64
+import json
 import struct
+import sys
 
 import pytest
 
-from conftest import ROOT, needs_bundle
+from conftest import HERE, needs_bundle
 from vector_env import harness, verifier
 
-EXAMPLE = {"command": ["node", str(ROOT / "example" / "solve.mjs")]}
+REPLAY = {"command": [sys.executable, str(HERE / "replay_expert.py")]}
+SOLVED = json.loads((HERE / "data" / "solved.json").read_text())
 ROWS = [[0.5, -1.25, 3.0, -0.0, 1e-300, 2.5e10, 1.0], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0]]
 
 
@@ -30,11 +33,11 @@ def test_bad_rows_are_refused():
 
 @pytest.fixture(scope="module")
 def solved(scenes3):
-    res = harness.run(EXAMPLE, scenes3, time_limit_s=15, wall_s=60)
-    for sc, r in zip(scenes3, res):
-        if r["outcome"] == "success":
-            return sc, r
-    pytest.skip("the example expert solved none of the scenes")
+    sc = scenes3[SOLVED["seed"] - 1]
+    assert sc["scene_id"] == SOLVED["scene_id"]
+    r = harness.run(REPLAY, [sc], time_limit_s=15, wall_s=60)[0]
+    assert r["outcome"] == "success" and r["n"] == SOLVED["n"], r
+    return sc, r
 
 
 @needs_bundle

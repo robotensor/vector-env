@@ -195,8 +195,7 @@ again from tick 0 with a new key, at most `max_restarts` times (`harness.remote.
 scene's first key is `"<index>.<restarts_used[i]>"` and it has only the rest of `max_restarts`. Any other exception
 from the channel is `harness_error`.
 
-A policy service (`vector-policy serve`, or anything that answers `POST /v1/act` in `vector-policy/2`) runs
-without a wrapper process:
+A policy service (anything that answers `POST /v1/act` in `vector-policy/2`) runs without a wrapper process:
 
 ```python
 res = harness.run({"policy": {"url": "<policy-url>", "token": tok, "calls": 40, "timeout_s": 60,
@@ -292,7 +291,7 @@ Every result has `outcome` and `infra`. The pick rules give `success`, `missed`,
 | `start_failed` | yes | the expert command could not be started, or docker never created the container (no `--cidfile` written: daemon error, bad option, image pruned meanwhile) |
 | `scene_error` | yes | the scene does not restore to its state hash (not the expert's doing) |
 | `harness_error` | yes | the harness itself crashed |
-| `policy_unavailable` | yes | never set by the harness: a caller (vector-server) gives it to its own command expert's `expert_error` with `exit_code` 75 (vector-policy's `expert.mjs` when its policy service is unavailable) |
+| `policy_unavailable` | yes | never set by the harness: a caller gives it to a command expert's `expert_error` with `exit_code` 75 (an expert that wraps a policy service, when that service is unavailable) |
 
 A result whose expert process exited also has `exit_code` (the process's exit code, or the signal name).
 `infra: true` results say nothing about the expert: re-run them rather than score them. Only signals the expert
