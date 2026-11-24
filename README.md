@@ -347,7 +347,7 @@ One JSON object per line on the expert's stdin and stdout.
 - A row is 6 arm joint targets (rad) and the grip, 0 (open) to 1 (closed); one row per tick of 1/20 s.
 - **Applied rows.** Every result also has `ctrl_applied`: the rows of `ctrl` as the simulator applied them, each arm
   value clamped to its actuator `ctrlrange` and the grip to 0..1, `-0` as `0`. `ctrl` and `action_hash` stay the rows
-  the expert sent; training data uses `ctrl_applied`.
+  the expert sent.
 - `rows: []` holds the last row until the rules decide. `"obs": true` adds an image to the next state.
 - `{"type":"error","error":"..."}` gives up. Anything else on stdout ends the scene as `expert_error`.
 - The try ends at the rules' verdict or at `time_limit_s` of robot time (`timed_out`); the scene's wall budget ends
