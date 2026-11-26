@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vector-env"
 version = "0.1.0"
-description = "The Vector bin-picking environment: scene generator, versioned assets, task rules and the expert step harness"
+description = "The Vector task environments: scene generators, asset bundles, task rules and the expert step harness, one folder per skill"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -22,13 +22,14 @@ build = ["trimesh==5.2.1", "coacd==1.0.14", "fast-simplification==0.2.0"]
 test = ["pytest==9.2.0"]
 
 [project.scripts]
-vector-env = "vector_env.cli:main"
+vector-env = "vector_env.command:main"
 
 [tool.setuptools.packages.find]
 include = ["vector_env*"]
 
 [tool.setuptools.package-data]
-vector_env = ["*.yaml", "build/*.yaml"]
+vector_env = ["*.yaml", "skills/*/*.yaml", "skills/*/build/*.yaml"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "skills"]
+norecursedirs = ["node_modules", ".*", "*.egg-info"]

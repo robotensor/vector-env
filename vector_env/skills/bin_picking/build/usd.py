@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-from .. import meshes
+from . import meshes
 
 NAME = "library"
 PREFIX = "lib"

@@ -6,7 +6,7 @@ import pytest
 from vector_env import assets
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[2]
 needs_bundle = pytest.mark.skipif(assets.find() is None, reason=assets.MISSING)
 
 

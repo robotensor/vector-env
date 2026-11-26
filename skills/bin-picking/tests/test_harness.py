@@ -9,7 +9,7 @@ from conftest import HERE, ROOT, fake
 
 from vector_env import harness
 
-EXAMPLE = {"command": ["node", str(ROOT / "example" / "solve.mjs")]}
+EXAMPLE = {"command": ["node", str(ROOT / "skills" / "bin-picking" / "example" / "solve.mjs")]}
 RESULT_KEYS = {"scene_id", "outcome", "success", "t", "ctrl", "n", "wall_s", "error"}
 
 

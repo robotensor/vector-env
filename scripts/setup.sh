@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+found=()
+for f in skills/*/example/Dockerfile; do
+  [ -f "$f" ] && found+=("${f%/example/Dockerfile}")
+done
+list=$(IFS=,; echo "${found[*]:-}" | sed 's/,/, /g')
+if [ -n "${VECTOR_ENV_SKILL:-}" ]; then
+  SKILL_DIR=skills/$VECTOR_ENV_SKILL
+  if [ ! -f "$SKILL_DIR/example/Dockerfile" ]; then
+    echo "setup: $SKILL_DIR/example/Dockerfile does not exist (skill folders: ${list:-none})" >&2
+    exit 1
+  fi
+elif [ "${#found[@]}" -eq 1 ]; then
+  SKILL_DIR=${found[0]}
+elif [ "${#found[@]}" -eq 0 ]; then
+  echo "setup: no skill folder has an example/Dockerfile (skills/<skill>/example/Dockerfile)" >&2
+  exit 1
+else
+  echo "setup: several skill folders ($list): set VECTOR_ENV_SKILL to one of them" >&2
+  exit 1
+fi
+SKILL=${SKILL_DIR#skills/}
 SIM=../vector-sim
-SIM_REF=${VECTOR_SIM_REF:-$(sed -n 's/^ARG VECTOR_SIM_REF=\([^[:space:]]*\).*/\1/p' example/Dockerfile)}
+SIM_REF=${VECTOR_SIM_REF:-$(sed -n 's/^ARG VECTOR_SIM_REF=\([^[:space:]]*\).*/\1/p' "$SKILL_DIR/example/Dockerfile")}
 if [ -z "$SIM_REF" ]; then
-  echo "setup: example/Dockerfile has no ARG VECTOR_SIM_REF=<tag> and VECTOR_SIM_REF is not set" >&2
+  echo "setup: $SKILL_DIR/example/Dockerfile has no ARG VECTOR_SIM_REF=<tag> and VECTOR_SIM_REF is not set" >&2
   exit 1
 fi
 check_ref() {
@@ -35,7 +56,7 @@ if [ -z "${VECTOR_ENV_JS_ONLY:-}" ]; then
   fi
 fi
 (cd js && npm ci --no-audit --no-fund)
-(cd example && npm ci --no-audit --no-fund)
-if [ -z "${VECTOR_ENV_JS_ONLY:-}" ] && ! err=$(.venv/bin/vector-env assets pull 2>&1 >/dev/null); then
+(cd "$SKILL_DIR/example" && npm ci --no-audit --no-fund)
+if [ -z "${VECTOR_ENV_JS_ONLY:-}" ] && ! err=$(VECTOR_ENV_SKILL=$SKILL .venv/bin/vector-env assets pull 2>&1 >/dev/null); then
   echo "assets: not installed yet (${err#vector-env: }); set VECTOR_ENV_ASSETS_SOURCE (hf://<repo> or a folder) or VECTOR_ENV_BUNDLE, then .venv/bin/vector-env assets pull" >&2
 fi

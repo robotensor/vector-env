@@ -1,14 +1,11 @@
-from __future__ import annotations
+"""Old import path of vector_env.skills.bin_picking.build."""
+import sys
 
-import importlib
-
-SOURCES = {
-    "library": "vector_env.build.usd",
-    "demo": "vector_env.build.demo",
-}
+from ..skills.bin_picking import build as _module
 
 
-def source(name: str):
-    if name not in SOURCES:
-        raise KeyError(f"unknown asset source {name!r}; known: {sorted(SOURCES)}")
-    return importlib.import_module(SOURCES[name])
+def __getattr__(name):
+    return getattr(_module, name)
+
+
+sys.modules[__name__] = _module

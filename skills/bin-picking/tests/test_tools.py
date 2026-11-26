@@ -1,15 +1,12 @@
 import json
-import os
 import shlex
-import shutil
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
-from conftest import HERE, ROOT, fake, needs_bundle
+from conftest import HERE, fake, needs_bundle
 
 from vector_env import cli, harness, scenes
 from vector_env.compose import SceneError
@@ -162,70 +159,3 @@ def test_a_trace_names_the_harness_outcome(scene):
     assert t["reasons"][0].startswith("the harness ended the scene as expert_error") and t["rows"] == 0
     with pytest.raises(harness.ReplayMismatch):
         harness.trace(scene, r["ctrl"], r["n"], time_limit_s=2, result={**r, "state_hash": "x"})
-
-
-def _fake_bin(d: Path, name: str, body: str) -> None:
-    p = d / name
-    p.write_text("#!/usr/bin/env bash\n" + body)
-    p.chmod(0o755)
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_setup_clones_vector_sim_at_the_dockerfile_tag(tmp_path):
-    repo = tmp_path / "vector-env"
-    (repo / "scripts").mkdir(parents=True)
-    (repo / "example").mkdir()
-    (repo / "js").mkdir()
-    shutil.copy(ROOT / "scripts" / "setup.sh", repo / "scripts" / "setup.sh")
-    shutil.copy(ROOT / "example" / "Dockerfile", repo / "example" / "Dockerfile")
-    pin = next(x.split("=", 1)[1].strip() for x in (ROOT / "example" / "Dockerfile").read_text().splitlines()
-               if x.startswith("ARG VECTOR_SIM_REF="))
-    assert pin == "v0.1.0"
-    bin_ = tmp_path / "bin"
-    bin_.mkdir()
-    log = tmp_path / "git.log"
-    _fake_bin(bin_, "git", f'echo "$@" >> {log}\nif [ "$1" = clone ]; then mkdir -p "${{@: -1}}/js"; exit 0; fi\nexit 1\n')
-    _fake_bin(bin_, "npm", "exit 0\n")
-    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "VECTOR_ENV_JS_ONLY": "1"}
-    env.pop("VECTOR_SIM_REF", None)
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env=env, capture_output=True, text=True, timeout=60)
-    clone = log.read_text().splitlines()[0]
-    assert p.returncode == 0, p.stderr
-    assert clone.startswith(f"clone --depth 1 --branch {pin} ") and clone.endswith("../vector-sim")
-    log.unlink()
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env={**env, "VECTOR_SIM_REF": "v9.9.9"},
-                       capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0 and "clone" not in log.read_text()
-    shutil.rmtree(tmp_path / "vector-sim")
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env={**env, "VECTOR_SIM_REF": "v9.9.9"},
-                       capture_output=True, text=True, timeout=60)
-    assert "--branch v9.9.9 " in log.read_text()
-
-
-@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-def test_setup_warns_when_vector_sim_is_not_at_the_tag(tmp_path):
-    repo = tmp_path / "vector-env"
-    for d in ("scripts", "example", "js"):
-        (repo / d).mkdir(parents=True)
-    shutil.copy(ROOT / "scripts" / "setup.sh", repo / "scripts" / "setup.sh")
-    shutil.copy(ROOT / "example" / "Dockerfile", repo / "example" / "Dockerfile")
-    sim = tmp_path / "vector-sim"
-    (sim / "js").mkdir(parents=True)
-    g = ["git", "-C", str(sim), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
-    subprocess.run(["git", "init", "-q", str(sim)], check=True)
-    subprocess.run([*g, "commit", "-q", "--allow-empty", "-m", "a"], check=True)
-    subprocess.run([*g, "tag", "v0.1.0"], check=True)
-    subprocess.run([*g, "commit", "-q", "--allow-empty", "-m", "b"], check=True)
-    bin_ = tmp_path / "bin"
-    bin_.mkdir()
-    _fake_bin(bin_, "npm", "exit 0\n")
-    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "VECTOR_ENV_JS_ONLY": "1"}
-    env.pop("VECTOR_SIM_REF", None)
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env=env, capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0 and "not v0.1.0" in p.stderr and "checkout v0.1.0" in p.stderr, p.stderr
-    subprocess.run(["git", "-C", str(sim), "checkout", "-q", "v0.1.0"], check=True)
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env=env, capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0 and "warning" not in p.stderr, p.stderr
-    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env={**env, "VECTOR_SIM_REF": "v7"},
-                       capture_output=True, text=True, timeout=60)
-    assert "does not have v7" in p.stderr

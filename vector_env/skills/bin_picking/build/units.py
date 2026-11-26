@@ -68,10 +68,10 @@ def _ensure_python(mod) -> None:
     if not USD_PYTHON or not Path(USD_PYTHON).is_file():
         raise SystemExit(f"source {mod.NAME} reads USD: pxr is missing here; set VECTOR_USD_PYTHON to a python that has "
                          f"it (is {USD_PYTHON!r})")
-    root = str(Path(__file__).resolve().parents[2])
+    root = str(Path(__file__).resolve().parents[4])
     env = {**os.environ, "PYTHONPATH": root + os.pathsep + os.environ.get("PYTHONPATH", "")}
     print(f"pxr missing: re-running under {USD_PYTHON}", flush=True)
-    os.execve(USD_PYTHON, [USD_PYTHON, "-m", "vector_env.build", *sys.argv[1:]], env)
+    os.execve(USD_PYTHON, [USD_PYTHON, "-m", "vector_env.skills.bin_picking.build", *sys.argv[1:]], env)
 
 
 def build(name: str, bundle: Path, src: str | None = None, procs: int = 8, limit: int | None = None,
@@ -83,7 +83,7 @@ def build(name: str, bundle: Path, src: str | None = None, procs: int = 8, limit
     src = src or mod.DEFAULT_SRC or (str(bundle) if getattr(mod, "SRC_IS_BUNDLE", False) else None)
     if not src:
         raise SystemExit(f"source {name}: give its input with --src (or its environment variable, see "
-                         f"vector_env/build/{name}.py)")
+                         f"vector_env/skills/bin_picking/build/{name}.py)")
     t0 = time.time()
     units = mod.units(src)
     if units_file:
@@ -105,8 +105,8 @@ def build(name: str, bundle: Path, src: str | None = None, procs: int = 8, limit
     t1 = time.time()
     if todo:
         ctx = mp.get_context("fork")
-        with ctx.Pool(procs, maxtasksperchild=500) as pool, open(errs, "a") as ef:
-            for k, (unit, ok, dt, nbytes, err) in enumerate(pool.imap_unordered(_work, todo, chunksize=2), 1):
+        with ctx.Pool(procs, maxtasksperchild=500) as workers, open(errs, "a") as ef:
+            for k, (unit, ok, dt, nbytes, err) in enumerate(workers.imap_unordered(_work, todo, chunksize=2), 1):
                 if ok:
                     n_ok += 1
                     build_s += dt

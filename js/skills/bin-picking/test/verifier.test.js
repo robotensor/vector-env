@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import { Cells, settle, replayCtrl, actionHash, verifyRows, probeScene } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
+process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..', '..', '..');
 const { compose, SETTINGS, BUNDLE, SKIP } = await import('@vector/sim/testing');
 // A pick recorded on the settled fixture scene: rows that lift the target, for the checks below.
 const PICK = JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures', 'pick.json'), 'utf8'));

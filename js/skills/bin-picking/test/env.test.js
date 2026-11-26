@@ -6,7 +6,7 @@ import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob
 import { b64ToF64 } from '@vector/sim';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..');
+process.env.VECTOR_ENV_DIR ||= path.resolve(HERE, '..', '..', '..', '..');
 const { compose, SETTINGS, BUNDLE, SKIP } = await import('@vector/sim/testing');
 const cells = await new Cells(BUNDLE, 1).init();
 const base = compose(SETTINGS, 11);

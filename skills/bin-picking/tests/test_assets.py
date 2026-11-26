@@ -75,9 +75,9 @@ def test_hugging_face_source(env, monkeypatch):
 
     import huggingface_hub
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-    d = assets.pull("t3", "hf://team/assets@v1", env / "hf")
+    d = assets.pull("t3", "hf://team/assets@assets-r1", env / "hf")
     assert (d / "robot" / "a.stl").is_file()
-    assert calls == [("team/assets", "t3/assets.json", "dataset", "v1"), ("team/assets", "t3/bundle.tar", "dataset", "v1")]
+    assert calls == [("team/assets", "t3/assets.json", "dataset", "assets-r1"), ("team/assets", "t3/bundle.tar", "dataset", "assets-r1")]
 
 
 def test_no_source_is_an_error(env, monkeypatch):

@@ -1,22 +1,23 @@
 {
   "name": "@vector/env",
   "version": "0.1.0",
-  "description": "The simulator side of vector-env: scene settling, replay and the vector-expert/2 step coordinator",
+  "description": "The simulator side of vector-env: scene settling, replay and the step coordinator of each skill",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "exports": {
-    ".": "./src/index.js",
-    "./*": "./src/*"
+    ".": "./skills/bin-picking/src/index.js",
+    "./skills/*": "./skills/*",
+    "./*": "./skills/bin-picking/src/*"
   },
   "bin": {
-    "vector-env-sim": "./bin/sim.mjs",
-    "vector-env-harness": "./bin/harness.mjs",
-    "vector-env-verify": "./bin/verifier.mjs"
+    "vector-env-sim": "./skills/bin-picking/bin/sim.mjs",
+    "vector-env-harness": "./skills/bin-picking/bin/harness.mjs",
+    "vector-env-verify": "./skills/bin-picking/bin/verifier.mjs"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js skills/*/test/*.test.js"
   },
   "dependencies": {
     "@vector/sim": "file:../../vector-sim/js"

@@ -1,9 +1,9 @@
 # Example expert
 
-An almost blind `vector-expert/2` expert: the message loop with the harness, packaged as an image. It reads only the
-arm's start pose, lowers the arm a little, closes the gripper and goes back up, the same motion for every scene. It
-never looks at the parts or the target, so most scenes end without a pick (score about 0). Copy it and replace
-`plan()` with your own planner.
+An almost blind `vector-expert/2` expert for bin-picking: the message loop with the harness, packaged as an image.
+It reads only the arm's start pose, lowers the arm a little, closes the gripper and goes back up, the same motion
+for every scene. It never looks at the parts or the target, so most scenes end without a pick (score about 0). Copy
+it and replace `plan()` with your own.
 
 ```mermaid
 flowchart TD
@@ -26,14 +26,16 @@ flowchart TD
 
 The rows depend only on the messages, never on a clock, so the expert is deterministic. To plan a real pick, build
 the cell from `start.scene` with `@vector/sim` (installed by `package.json`), solve the poses with its IK and check
-a plan with `runPlan` before sending it: the vector-sim README, section API, describes every call. A closed-loop
-expert asks for `obs: true` and replans from each `state`.
+a plan with `runPlan` before sending it: the bin-picking README of vector-sim (`js/skills/bin-picking/README.md`),
+section API, describes every call. A closed-loop expert asks for `obs: true` and replans from each `state`.
 
 ## Running it
 
+From the vector-env root:
+
 ```bash
-cd example && npm ci && cd ..          # setup.sh does it: links @vector/sim from ../../vector-sim/js
-.venv/bin/vector-env run --command "node example/solve.mjs" --scenes 30 --seed 1 --workers 4
+(cd skills/bin-picking/example && npm ci)     # setup.sh does it: links @vector/sim from the vector-sim beside vector-env
+.venv/bin/vector-env run --command "node skills/bin-picking/example/solve.mjs" --scenes 30 --seed 1 --workers 4
 ```
 
 `--command` runs the program on this machine (no docker, no sandbox limits). `--stderr DIR` keeps its stderr of
@@ -44,16 +46,17 @@ starts at once.
 ## The image
 
 ```bash
-cd example && docker build -t ghcr.io/<you>/bin-expert:dev . && cd ..
+(cd skills/bin-picking/example && docker build -t ghcr.io/<you>/bin-expert:dev .)
 .venv/bin/vector-env run --image ghcr.io/<you>/bin-expert:dev --scenes 30 --seed 1 --workers 4
 ```
 
-The Dockerfile fetches vector-sim at `VECTOR_SIM_REF`, by default the tag `v0.1.0`: the version of
-`@vector/sim` in `package-lock.json` and of the simulator the harness runs. Planning with another version can give
-states the harness does not reproduce, so keep the default; when a new vector-sim is released, build with
-`--build-arg VECTOR_SIM_REF=v<version>` (a tag, a branch or a full commit sha) and update `package-lock.json`.
-`VECTOR_SIM_GIT` sets the repository. This `ARG` line is the one pin: `scripts/setup.sh` reads it and clones the
-local vector-sim (the one `--command` plans with) at the same tag.
+The Dockerfile fetches vector-sim at `VECTOR_SIM_REF`, by default the round tag `bin-picking-expert-r1`: the
+simulator the harness runs in that round and the `@vector/sim` of `package-lock.json`. What miners run for a round
+is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim, so keep the default of the round you
+play; for another round build with `--build-arg VECTOR_SIM_REF=<leaf-id>-r<n>` (a tag, a branch or a full commit
+sha also works) and update `package-lock.json`. `VECTOR_SIM_GIT` sets the repository. `ARG VECTOR_SIM_REF=` is the
+one pin: `scripts/setup.sh` reads it and clones the local vector-sim (the one `--command` plans with) at the same
+tag.
 
 The image copies `package.json`, `package-lock.json` and every `*.mjs` of this folder and runs `node solve.mjs`.
 When you rename the entry file, change `ENTRYPOINT`; other files (data, other folders) need their own `COPY`.
