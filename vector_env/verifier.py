@@ -61,7 +61,7 @@ def chain_next(prev: str, k: int, a: int, b: int, sh: str, rows) -> str:
     return _hex(fnv1a64(row_bytes(rows), fnv1a64(f"{prev}:{int(k)}:{int(a)}:{int(b)}:{sh}:".encode())))
 
 
-class Pool:
+class Workers:
     def __init__(self, size: int | None = None, bundle: Path | None = None):
         self.size = max(1, int(size or os.environ.get("VECTOR_ENV_VERIFIERS") or 1))
         self.bundle = bundle
@@ -97,22 +97,22 @@ class Pool:
             p.close()
 
 
-_pool: Pool | None = None
-_pool_lock = threading.Lock()
+_workers: Workers | None = None
+_workers_lock = threading.Lock()
 
 
-def pool() -> Pool:
-    global _pool
-    with _pool_lock:
-        if _pool is None:
-            _pool = Pool()
-        return _pool
+def workers() -> Workers:
+    global _workers
+    with _workers_lock:
+        if _workers is None:
+            _workers = Workers()
+        return _workers
 
 
-def reset(p: Pool | None = None) -> None:
-    global _pool
-    with _pool_lock:
-        old, _pool = _pool, p
+def reset(p: Workers | None = None) -> None:
+    global _workers
+    with _workers_lock:
+        old, _workers = _workers, p
     if old is not None and old is not p:
         old.close()
 
@@ -134,7 +134,7 @@ def verify(scene: dict, rows, *, time_limit_s: float, hold: bool = False, claim:
            "hold": bool(hold), "every": int(every), "marks": bool(marks)}
     if claim:
         msg["claim"] = claim
-    return pool().call(msg, timeout=timeout)
+    return workers().call(msg, timeout=timeout)
 
 
 def verify_result(scene: dict, result: dict, *, time_limit_s: float) -> dict:
@@ -145,7 +145,7 @@ def verify_result(scene: dict, result: dict, *, time_limit_s: float) -> dict:
 
 
 def probe(scene: dict, ticks: int = 40, every: int = 5) -> dict:
-    r = pool().call({"op": "probe", "scene": _wire(scene), "ticks": int(ticks), "every": int(every)})
+    r = workers().call({"op": "probe", "scene": _wire(scene), "ticks": int(ticks), "every": int(every)})
     if not r.get("ok"):
         raise VerifyError(r.get("detail") or r.get("reason") or "probe failed")
     r.pop("ok", None)
@@ -153,8 +153,8 @@ def probe(scene: dict, ticks: int = 40, every: int = 5) -> dict:
 
 
 def prepare(scene: dict) -> bool:
-    return bool(pool().call({"op": "prepare", "scene": _wire(scene)}).get("ok"))
+    return bool(workers().call({"op": "prepare", "scene": _wire(scene)}).get("ok"))
 
 
 def pin() -> dict:
-    return pool().call({"op": "pin"})
+    return workers().call({"op": "pin"})
