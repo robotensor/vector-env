@@ -63,6 +63,8 @@ vector-env skills
 
 ## 4. Old module paths
 
+The old paths of this section are temporary. They stay through round `bin-picking-expert-r2` and are removed in the first change after that tag.
+
 These import paths stay, each the same module object as the skill module:
 
 | old path | module |
@@ -95,6 +97,8 @@ These import paths stay, each the same module object as the skill module:
 - `vector_env/env.yaml` is a relative symbolic link to `skills/bin_picking/env.yaml`.
 
 ## 5. npm package `@vector/env`
+
+The compatibility entries of `exports` (the old specifiers) are temporary. They stay through round `bin-picking-expert-r2` and are removed in the first change after that tag.
 
 `js/package.json` keeps `name`, `version`, `type`, `engines`, `dependencies` (`@vector/sim` from
 `file:../../vector-sim/js`) and `license`, and sets:
