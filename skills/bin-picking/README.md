@@ -178,10 +178,10 @@ A trace (`format: vector-env-trace/1`) re-simulates the result's rows with the r
 | `rows`, `sent`, `held` | rows stepped before the verdict, rows the expert sent, ticks the last row was held after them |
 | `reasons` | why it ended, in words: the verdict, the rows, first touch of the target, when the rows close the grip and whether the fingers shut on nothing, when the target was held, how high its lowest point got against the lift line, parts that left the bin. When the harness ended the scene itself (`expert_error`, `wall_timeout`) the first reason says so |
 | `summary` | the same as numbers: `target_first_touch`, `target_held` (tick ranges), `other_held`, `grip_first_asked`, `grip_first_shut`, `shut_on_nothing`, `target_max_above_line_mm`, `target_held_above_line_ticks`, `nearest_mm`/`nearest_tick` (tcp to the target's center), `left_bin` |
-| `ticks[k]` | per tick (0 = the start): `row` (the 7 values stepped), `q` (arm joints, rad), `grip` (0..1), `shut` (the fingers fully closed), `tcp` (m, world), `tcp_quat` (w, x, y, z), `held` (parts between both pads), `touch` (parts touching the gripper), `target` (`pos`, `above_line_mm`, `inside`, `dist_mm`); `after_rows` marks ticks after the expert's last row |
+| `ticks[k]` | per tick (0 = the start): `row` (the 7 values stepped), `q` (arm joints, rad), `grip` (0..1), `shut` (the fingers fully closed), `tcp` (m, world), `tcp_quat` (w, x, y, z), `held` (parts between the two fingers: both pads in older scenes, the pad, follower or spring link of each finger in pile scenes), `touch` (parts touching the gripper), `target` (`pos`, `above_line_mm`, `inside`, `dist_mm`); `after_rows` marks ticks after the expert's last row |
 | `lift_line_z`, `hold_s`, `tick_s`, `time_limit_s`, `target`, `result` | the rule constants of the scene, and the run's own result when one was given |
 
-A success needs the target held between both pads, its lowest point above `lift_line_z` (the bin rim +
+A success needs the target held between the two fingers (both pads in older scenes), its lowest point above `lift_line_z` (the bin rim +
 `lift_clear`) and no other part above it, for `hold_s` in a row. `harness.trace(scene, ctrl, n, time_limit_s=15,
 result=r)` returns the same in Python.
 

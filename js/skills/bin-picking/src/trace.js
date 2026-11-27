@@ -159,7 +159,7 @@ export function traceCtrl(cell, scene, ctrl, n, timeLimitS) {
   else why.push(`the rows close the grip from tick ${S.ask}` + (S.empty !== null ? `; at tick ${S.empty} the fingers shut on nothing` : ''));
   if (!S.held.length) {
     const others = [...S.other].map(([i, e]) => `part ${i} for ${e.ticks} ticks from tick ${e.first}`);
-    why.push('the target was never held between both pads' + (others.length ? `; held instead: ${others.join(', ')}` : ''));
+    why.push('the target was never held between the fingers' + (others.length ? `; held instead: ${others.join(', ')}` : ''));
   } else {
     const last = S.held[S.held.length - 1];
     why.push(`the target was held for ${S.held.length} ticks (ticks ${span(ranges(S.held))})`
