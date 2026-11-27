@@ -559,7 +559,7 @@ def _rain(m, st, crate, part_rows, instances, parts, cfg, seed) -> dict:
     is calm and stops when the pile surface reaches `level` of the crate depth. With `bury`, the largest parts stay out of the rain: once it stops,
     the sim lays them over a `top` part near the centre (one on it, `ring_n` on a tight ring around it, the rest as a
     second layer on top) so it ends under one or two layers (a `hidden` target), checked with classify and retried
-    from a snapshot."""
+    from a snapshot; with `undo_failed`, a bury whose last try fails goes back to that snapshot (its parts stay out)."""
     R = cfg["rain"]
     rng = np.random.default_rng([int(seed), 0x7A17])
     order = rng.permutation(len(instances))
@@ -582,6 +582,8 @@ def _rain(m, st, crate, part_rows, instances, parts, cfg, seed) -> dict:
             bury["ring_n"] = max(0, min(len(big) - 1, int(B["ring_n"])))
         if B.get("cap") is not None:
             bury["cap"] = float(B["cap"])
+        if B.get("undo_failed"):
+            bury["undo_failed"] = True
     ix, iy = crate["inner_half"]
     cp = st["crate_pose"]
     yaw = math.radians(cp["yaw_deg"])

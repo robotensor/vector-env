@@ -175,8 +175,10 @@ def generate(seed: int, draw: dict | None = None, *, settings: dict | None = Non
         f = s.get("fill") or {}
         if f.get("asleep") is False:
             raise SceneError("the pile does not come to rest")
-        if f.get("level") is not None and float(f["level"]) < float(R["level_range"][0]) - float(R["level_tol"]):
-            raise SceneError(f"the pile fills {float(f['level']):.2f} of the crate (needs {R['level_range'][0]})")
+        if f.get("level") is not None:
+            lv, (l_lo, l_hi), tol = float(f["level"]), R["level_range"], float(R["level_tol"])
+            if not float(l_lo) - tol <= lv <= float(l_hi) + tol:
+                raise SceneError(f"the pile fills {lv:.2f} of the crate (needs {l_lo}-{l_hi})")
     if pile_mode(sc["settings"]) and s.get("parts_state"):
         sc, s = _freeze_deep(sc, s, seed, bundle)
     if s.get("target") is None:
