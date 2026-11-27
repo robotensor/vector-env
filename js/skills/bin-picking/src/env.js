@@ -1,8 +1,13 @@
 import { createHash } from 'node:crypto';
 import { mujoco, bundleFiles } from '@vector/sim/node.js';
-import { Cell, Episode, Camera, chooseTarget, b64encode, b64ToF64, CTRL } from '@vector/sim';
+import { Cell, Episode, Camera, pickTarget, classify, segBytes, b64encode, b64ToF64, CTRL, isPile, replayPicks, pickCount } from '@vector/sim';
 
 export const FORMAT = 'vector-expert/2';
+// pile scenes: several picks per scene
+export const FORMAT_PICKS = 'vector-expert/3';
+export const SCENE_DONE = 'done';
+
+export function multiPick(cell) { return isPile(cell); }
 
 export class SceneError extends Error {}
 
@@ -93,8 +98,20 @@ export function settle(cell, seed) {
   ep.beginFill();
   while (!ep.fillStep());
   ep.sealSetup();
-  const target = chooseTarget(cell, seed);
-  return { checkpoint: ep.checkpoint(), state_hash: cell.hash(), target, parts: cell.activeParts().length };
+  const rain = ep.fill?.F?.mode === 'rain', hid = cell.meta.fill?.hidden_target;
+  const cover = rain ? ep.fill.cover ?? -1 : Number.isInteger(hid) ? hid : null;
+  const { target, target_class, counts } = pickTarget(cell, seed, cover === null ? {} : { cover });
+  const out = { checkpoint: ep.checkpoint(), state_hash: cell.hash(), target, parts: cell.activeParts().length };
+  if (target_class !== null) Object.assign(out, { target_class, class_counts: counts });
+  if (rain) out.fill = { level: round(ep.fill.level, 4), spawned: ep.fill.spawned, ticks: ep.fill.k, cover: ep.fill.cover ?? null, asleep: cell.partsAsleep() };
+  if (cell.sleep && !rain) out.fill = { asleep: cell.partsAsleep(), ticks: ep.fill.k, cover };
+  // pile scenes built with freeze_deep: the settled pose and pile depth of every active part, for the second stage
+  if (rain && cell.cfg.rain?.freeze_deep) {
+    const C = classify(cell), P = cell.meta.parts, d = cell.d, act = cell.activeParts();
+    out.parts_state = act.map((i) => ({ i, depth: C.depth[i], cls: C.cls[i],
+      pose: [...Array.from(d.qpos.subarray(P[i].qpos, P[i].qpos + 7))] }));
+  }
+  return out;
 }
 
 export function restore(cell, scene) {
@@ -113,16 +130,18 @@ export function restore(cell, scene) {
   return ep;
 }
 
-export function observation(cell, { rgb = true } = {}) {
-  const cam = new Camera(cell);
+// camera + img: an image that camera just rendered of this state (reused, not rendered again)
+export function observation(cell, { rgb = true, camera = null, img = null } = {}) {
+  const cam = camera && img ? camera : new Camera(cell);
   try {
-    const img = cam.render();
+    if (!(camera && img)) img = cam.render();
     const o = { width: img.width, height: img.height, camera: cell.meta.camera,
-                depth: b64encode(new Uint8Array(img.depth.buffer)), seg: b64encode(img.seg) };
+                depth: b64encode(new Uint8Array(img.depth.buffer)), seg: b64encode(segBytes(img.seg)) };
+    if (img.seg_dtype) o.seg_dtype = img.seg_dtype;
     if (rgb) o.rgb = b64encode(cam.renderRGB(img));
     return o;
   } finally {
-    cam.dispose();
+    if (cam !== camera) cam.dispose();
   }
 }
 
@@ -130,14 +149,39 @@ export function physState(cell) {
   return { qpos: Array.from(cell.d.qpos), qvel: Array.from(cell.d.qvel) };
 }
 
+// A multi-pick scene's start for PickRun / replayPicks.
+export function pickStart(cell, scene) {
+  return { target: scene.target, target_class: scene.target_class ?? null, seed: cell.meta.seed ?? 0, picks: pickCount(cell) };
+}
+
+// The scene part of a multi-pick result: per-pick records (pick, target, target_class, outcome, t, tick, outs,
+// out_parts, tcp_path_m, joint_path_rad, crate_hits) and the totals.
+export function sceneSummary(run, { partial = true } = {}) {
+  const recs = run.picks.map(({ part, detail, ...r }) => r);
+  const p = partial ? run.partial() : null;
+  if (p) { const { part, detail, ...r } = p; recs.push(r); }
+  return { picks: recs, ...run.totals(p ? [...run.picks, p] : run.picks) };
+}
+
 export function replayCtrl(cell, scene, ctrl, n, timeLimitS) {
   setLimit(cell, timeLimitS);
   const ep = restore(cell, scene);
+  if (multiPick(cell)) {
+    const flat = typeof ctrl === 'string' ? b64ToF64(ctrl) : Float64Array.from(ctrl || []);
+    if (flat.length % CTRL) throw new SceneError(`ctrl length ${flat.length} is not a multiple of ${CTRL}`);
+    if (n !== undefined && n !== null && n !== flat.length / CTRL) throw new SceneError(`ctrl holds ${flat.length / CTRL} rows, not n = ${n}`);
+    for (let k = 0; k < flat.length; k++) if (!Number.isFinite(flat[k])) throw new SceneError('ctrl has a non-finite value');
+    const R = replayPicks(ep, pickStart(cell, scene), flat, { hold: true });
+    const S = sceneSummary(R.run, { partial: false }), last = R.run.picks[R.run.picks.length - 1];
+    const outcome = R.run.done ? (last && last.outcome === 'physics_error' ? 'physics_error' : SCENE_DONE) : null;
+    return { outcome, success: S.successes === S.picks_planned, ...S, t: S.t, tick: S.tick, hash: cell.hash(),
+             detail: last ? last.detail : null, rows: R.rows, held: R.held };
+  }
   const flat = typeof ctrl === 'string' ? b64ToF64(ctrl) : Float64Array.from(ctrl || []);
   if (flat.length % CTRL) throw new SceneError(`ctrl length ${flat.length} is not a multiple of ${CTRL}`);
   const rows = flat.length / CTRL;
   if (n !== undefined && n !== null && n !== rows) throw new SceneError(`ctrl holds ${rows} rows, not n = ${n}`);
-  ep.beginTry(scene.target);
+  ep.beginTry(scene.target, scene.target_class ?? null);
   let v = null, k = 0, row = null;
   for (; k < rows && !v; k++) {
     row = Array.from(flat.subarray(CTRL * k, CTRL * (k + 1)));
@@ -151,7 +195,12 @@ export function replayCtrl(cell, scene, ctrl, n, timeLimitS) {
   }
   const tick = ep.lastTry.verdict.tick;
   return { outcome: v.outcome, success: v.outcome === 'success', t: round(tick * cell.meta.tick_s), tick, hash: cell.hash(),
-           detail: v.detail, rows: k, held };
+           detail: v.detail, rows: k, held, ...tryMetrics(ep.lastTry.mon) };
+}
+
+// The per-try metrics of a monitor (every scene): outs, out_parts, tcp_path_m, joint_path_rad, crate_hits, target_class.
+export function tryMetrics(mon) {
+  return mon ? mon.metrics() : { outs: 0, out_parts: [], tcp_path_m: 0, joint_path_rad: 0, crate_hits: 0, target_class: null };
 }
 
 export function round(x, d = 6) {

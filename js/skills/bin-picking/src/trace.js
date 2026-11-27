@@ -1,5 +1,5 @@
-import { CTRL, b64ToF64 } from '@vector/sim';
-import { SceneError, setLimit, restore, round } from './env.js';
+import { CTRL, b64ToF64, replayPicks } from '@vector/sim';
+import { SceneError, setLimit, restore, round, tryMetrics, multiPick, pickStart, sceneSummary, SCENE_DONE } from './env.js';
 
 export const TRACE_FORMAT = 'vector-env-trace/1';
 
@@ -45,12 +45,40 @@ function flatCtrl(ctrl, n) {
   return { flat, rows };
 }
 
+// A multi-pick scene: one entry per tick (with its pick) and one reason line per pick.
+function tracePicks(cell, ep, scene, flat, rows) {
+  const tickS = cell.meta.tick_s, ticks = [];
+  let k = 0;
+  const look = (run, row, after) => {
+    k++;
+    const { held, touch } = cell.contacts(), tcp = cell.tcp(), p = cell.proprio();
+    const H = [], X = [];
+    for (let i = 0; i < cell.n; i++) { if (!cell.active[i]) continue; if (held[i]) H.push(i); if (touch[i]) X.push(i); }
+    const e = { tick: k, t: r4(k * tickS), pick: run.ep.cur ? run.k : run.picks.length - 1, row: row.map(r4), q: p.q.map(r4),
+                grip: r4(p.grip), tcp: tcp.pos.map(r4), tcp_quat: matQuat(tcp.mat).map(r4), held: H, touch: X };
+    if (after) e.after_rows = true;
+    ticks.push(e);
+  };
+  const R = replayPicks(ep, pickStart(cell, scene), flat, { hold: true, onTick: look });
+  const S = sceneSummary(R.run, { partial: false }), last = R.run.picks[R.run.picks.length - 1];
+  const outcome = R.run.done ? (last && last.outcome === 'physics_error' ? 'physics_error' : SCENE_DONE) : null;
+  const why = [`${outcome ?? 'no end'} after ${R.run.picks.length} of ${S.picks_planned} picks: ${S.successes} picked, ${S.outs} outs`];
+  for (const p of R.run.picks)
+    why.push(`pick ${p.pick} (part ${p.target}, ${p.target_class}): ${p.outcome} at tick ${p.tick} (${r4(p.t)} s): ${p.detail}`);
+  why.push(`the expert sent ${rows} rows` + (R.rows < rows ? `; the scene ended after ${R.rows} of them` : '')
+           + (R.held ? `; the last one was held for ${R.held} more ticks` : ''));
+  return { format: TRACE_FORMAT, scene_id: scene.scene_id ?? null, target: scene.target, time_limit_s: cell.cfg.rules.try_s,
+           tick_s: tickS, outcome, success: S.successes === S.picks_planned, ...S, hash: cell.hash(),
+           detail: last ? last.detail : null, rows: R.rows, sent: rows, held: R.held, reasons: why, ticks };
+}
+
 export function traceCtrl(cell, scene, ctrl, n, timeLimitS) {
   setLimit(cell, timeLimitS);
   const ep = restore(cell, scene);
   const { flat, rows } = flatCtrl(ctrl, n);
+  if (multiPick(cell)) return tracePicks(cell, ep, scene, flat, rows);
   const T = scene.target;
-  ep.beginTry(T);
+  ep.beginTry(T, scene.target_class ?? null);
   const o = ep.cur.mon.o;
   const tickS = cell.meta.tick_s;
   const tb = cell.meta.parts[T].body;
@@ -142,8 +170,10 @@ export function traceCtrl(cell, scene, ctrl, n, timeLimitS) {
   }
   const gone = [...S.left].map(([i, t]) => `part ${i}${i === T ? ' (the target)' : ''} at tick ${t}`);
   if (gone.length) why.push(`left the bin without being held: ${gone.join(', ')}`);
+  const M = tryMetrics(ep.lastTry.mon);
+  if (M.outs) why.push(`outs (parts that ended outside the bin): ${M.outs}, parts ${M.out_parts.join(', ')}`);
   return { format: TRACE_FORMAT, scene_id: scene.scene_id ?? null, target: T, time_limit_s: cell.cfg.rules.try_s,
            tick_s: tickS, lift_line_z: r4(o.liftZ), hold_s: o.holdS,
            outcome: verdict.outcome, success: verdict.outcome === 'success', t: r4(tick * tickS), tick, hash: cell.hash(),
-           detail: verdict.detail, part: verdict.part, rows: k, sent: rows, held, reasons: why, summary, ticks };
+           detail: verdict.detail, part: verdict.part, rows: k, sent: rows, held, ...M, reasons: why, summary, ticks };
 }
