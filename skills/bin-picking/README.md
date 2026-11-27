@@ -353,8 +353,9 @@ flowchart LR
 ## Outcomes
 
 Every result has `outcome` and `infra`. The pick rules give `success`, `missed`, `slipped`, `knocked_out`,
-`timed_out`, `wrong_part` (`rules.OUTCOMES`; pile scenes have no `wrong_part`, see the vector-sim README for their
-rules). The harness adds two groups (`rules.EXPERT_OUTCOMES`,
+`timed_out`, `wrong_part` (`rules.OUTCOMES`; pile scenes have no `wrong_part` but a `multi_pick` instead:
+two or more parts above the lift line at the same tick end the pick as a failure; `rules.PILE_OUTCOMES`; see the
+vector-sim README for their rules). The harness adds two groups (`rules.EXPERT_OUTCOMES`,
 `rules.INFRA_OUTCOMES`; `INFRA_OUTCOMES` also exported by the JS side):
 
 | outcome | `infra` | meaning |

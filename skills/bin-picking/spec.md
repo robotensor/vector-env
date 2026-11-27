@@ -34,7 +34,7 @@ These names and their behaviour are unchanged (old and new import paths, see the
   `Reconnected`; added for claims: `check_claim`, `wire_result`, `claim_task`, `encode_rows`, `decode_rows`,
   `CLAIM_KEYS`, `CLAIM_PICK_KEYS`. Every result gains `act_rows`, `dropped_ctrl` and `expert_s` (pile picks too).
 - `rules`: `OUTCOMES`, `EXPERT_OUTCOMES`, `INFRA_OUTCOMES`, `HARNESS_OUTCOMES`, `defaults`, `task`; added for pile
-  scenes: `PILE_OUTCOMES`, `TARGET_CLASSES`, `METRICS`, `SCENE_DONE` (`done`), `scene_mode`, `scene_picks`,
+  scenes: `PILE_OUTCOMES` (`multi_pick` in place of `wrong_part`), `TARGET_CLASSES`, `METRICS`, `SCENE_DONE` (`done`), `scene_mode`, `scene_picks`,
   `defaults(mode)`, `score_settings`, `score`, `pick_score`; `INFRA_OUTCOMES` gains `physics_error`.
 - `assets`: `find`, `ensure`, `bundle_dir`, `cache_root`, `info`, `pull`, `pack`, `write_manifest`, `resolve`,
   `ensure_pin`, `check_pin`, `pin_dir`, `for_scene`, `MISSING`,
