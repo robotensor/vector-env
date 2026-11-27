@@ -61,7 +61,7 @@ def test_step_deadline_pauses_the_simulator(scenes3):
     assert r[0]["outcome"] in ("timed_out", "missed", "knocked_out", "slipped"), r[0]
     s = r[1]
     assert s["outcome"] == "step_timeout" and not s["infra"] and "step deadline of 0.5 s (tick 20)" in s["error"], s
-    assert (s["tick"], s["n"], s["rows_sent"]) == (20, 20, 20) and 0.5 <= s["wall_s"] < 5, s
+    assert (s["tick"], s["n"], s["rows_sent"]) == (20, 20, 20) and 0.5 <= s["wall_s"] - s["setup_s"] < 5, s
     assert m.ends["1.0"]["outcome"] == "step_timeout"
 
 
@@ -122,7 +122,7 @@ def test_the_first_act_has_its_own_deadline(scenes3):
     assert r["outcome"] != "step_timeout" and r["error"] is None, r
     r = remote(FakeMiner(stall={"0.": 0}), scenes3[:1], step_deadline_s=0.3, first_step_deadline_s=0.5)[0]
     assert r["outcome"] == "step_timeout" and "first-step deadline of 0.5 s (tick 0)" in r["error"], r
-    assert 0.5 <= r["wall_s"] < 10, r
+    assert 0.5 <= r["wall_s"] - r["setup_s"] < 2, r  # counted from the end of the scene setup
 
 
 def test_async_and_threaded_entry_points(scenes3):
