@@ -8,8 +8,14 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
 from functools import lru_cache
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not on POSIX
+    fcntl = None
 
 from .settings import ROOT, env_config
 
@@ -19,6 +25,7 @@ MARK = ".verified"
 ARCHIVE = "bundle.tar"
 SKIP = {MANIFEST, MARK}
 VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 log = logging.getLogger("vector_env.assets")
 
 
@@ -161,19 +168,39 @@ def verify(bundle: Path) -> list[str]:
     return bad
 
 
+_ok: dict[tuple, tuple] = {}
+
+
+def _stamp(bundle: Path) -> tuple | None:
+    try:
+        a, b = (bundle / MANIFEST).stat(), (bundle / MARK).stat()
+    except OSError:
+        return None
+    return a.st_mtime_ns, a.st_size, b.st_mtime_ns, b.st_size
+
+
 def _verified(bundle: Path, version: str | None, sha: str | None) -> bool:
-    man = read_manifest(bundle)
-    if man is None or (version and man.get("version") != version):
+    key, st = (str(bundle), version, sha), _stamp(Path(bundle))
+    if st is None:
         return False
+    if _ok.get(key) == st:
+        return True
     have = manifest_sha(bundle)
     if sha and have != sha:
         return False
     mark = bundle / MARK
-    return mark.is_file() and mark.read_text().strip() == have
+    if not (mark.is_file() and mark.read_text().strip() == have):
+        return False
+    if version:
+        man = read_manifest(bundle)
+        if man is None or man.get("version") != version:
+            return False
+    _ok[key] = st
+    return True
 
 
-def info(bundle: Path | None = None) -> dict:
-    d = Path(bundle) if bundle else bundle_dir()
+def info(bundle=None) -> dict:
+    d = resolve(bundle) if isinstance(bundle, dict) else Path(bundle) if bundle else bundle_dir()
     man = read_manifest(d)
     if man is None:
         raise AssetsError(f"no {MANIFEST} in {d} (vector-env assets pull, or vector-env assets manifest)")
@@ -208,12 +235,12 @@ def _source(source: str | None) -> str:
     return s
 
 
-def _fetch(source: str, version: str, name: str, tmp: Path) -> Path:
+def _fetch(source: str, version: str, name: str, tmp: Path, token: str | None = None) -> Path:
     if source.startswith("hf://"):
         from huggingface_hub import hf_hub_download
         repo, _, rev = source[5:].partition("@")
         p = hf_hub_download(repo_id=repo, filename=f"{version}/{name}", repo_type="dataset", revision=rev or None,
-                            token=os.environ.get("HF_TOKEN") or None, local_dir=str(tmp))
+                            token=token or os.environ.get("HF_TOKEN") or None, local_dir=str(tmp))
         return Path(p)
     base = Path(source[7:] if source.startswith("file://") else source).expanduser()
     p = base / version / name
@@ -236,7 +263,8 @@ def _members(tf: tarfile.TarFile, listed: set[str]) -> None:
             raise AssetsError(f"the archive holds {m.name[:120]!r}, which the manifest does not list")
 
 
-def pull(version: str, source: str | None = None, dest: Path | None = None, sha256: str | None = None) -> Path:
+def pull(version: str, source: str | None = None, dest: Path | None = None, sha256: str | None = None,
+         token: str | None = None) -> Path:
     version = check_version(version)
     src = _source(source)
     dest = Path(dest or cache_root() / version)
@@ -245,7 +273,7 @@ def pull(version: str, source: str | None = None, dest: Path | None = None, sha2
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".pull-", dir=dest.parent) as t:
         tmp = Path(t)
-        man_p = _fetch(src, version, MANIFEST, tmp / "dl")
+        man_p = _fetch(src, version, MANIFEST, tmp / "dl", token)
         got = _sha_file(man_p)
         if sha256 and got != sha256:
             raise AssetsError(f"asset manifest {version}: sha256 {got} is not the pinned {sha256}")
@@ -256,7 +284,7 @@ def pull(version: str, source: str | None = None, dest: Path | None = None, sha2
             listed = {check_path(row[0]) for row in man["files"]}
         except (TypeError, IndexError, KeyError) as e:
             raise AssetsError(f"asset manifest {version}: bad file entry") from e
-        tar_p = _fetch(src, version, ARCHIVE, tmp / "dl")
+        tar_p = _fetch(src, version, ARCHIVE, tmp / "dl", token)
         out = tmp / "bundle"
         out.mkdir()
         with tarfile.open(tar_p) as tf:
@@ -293,3 +321,141 @@ def pack(bundle: Path, out: Path, version: str | None = None) -> dict:
     (d / (ARCHIVE + ".tmp")).replace(d / ARCHIVE)
     return {"version": version, "sha256": manifest_sha(bundle), "dir": str(d), "files": len(man["files"]),
             "archive_bytes": (d / ARCHIVE).stat().st_size}
+
+
+# Other bundles in the same format, chosen by the caller: a bundle folder, or a pin {version, sha256, source}.
+
+def check_pin(pin) -> dict:
+    if not isinstance(pin, dict):
+        raise AssetsError("an asset pin is a mapping {version, sha256, source}")
+    sha = pin.get("sha256") or None
+    if sha is not None and not SHA256.match(str(sha)):
+        raise AssetsError("an asset pin's sha256 must be 64 lowercase hex digits")
+    return {"version": check_version(pin.get("version")), "sha256": sha, "source": pin.get("source") or None,
+            "token": pin.get("token") or None}
+
+
+def _is_default(version: str, sha: str | None) -> bool:
+    d = pinned()
+    return version == d["version"] and (sha is None or sha == d["sha256"])
+
+
+def pin_dir(version: str, sha256: str | None = None) -> Path:
+    """The cache folder of a pinned bundle: <cache>/<version> for the env.yaml pin (or a pin without a sha256),
+    <cache>/<version>~<sha256[:16]> for any other, so bundles with the same version name never share a folder."""
+    v = check_version(version)
+    if sha256 is None or _is_default(v, sha256):
+        return cache_root() / v
+    return cache_root() / f"{v}~{sha256[:16]}"
+
+
+_locks: dict[str, threading.Lock] = {}
+_locks_lock = threading.Lock()
+
+
+class _Lock:
+    def __init__(self, dest: Path):
+        self.dest = dest
+        with _locks_lock:
+            self.t = _locks.setdefault(str(dest), threading.Lock())
+
+    def __enter__(self):
+        self.t.acquire()
+        self.f = None
+        if fcntl is not None:
+            try:
+                self.dest.parent.mkdir(parents=True, exist_ok=True)
+                self.f = open(self.dest.parent / f".{self.dest.name}.lock", "w")
+                fcntl.flock(self.f, fcntl.LOCK_EX)
+            except OSError:
+                self.f = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.f is not None:
+            self.f.close()
+        self.t.release()
+
+
+def _hide(msg: str, source: str | None, token: str | None) -> str:
+    if token:
+        msg = msg.replace(token, "<token>")
+    for s in (source, source[5:], source[5:].partition("@")[0]) if source and source.startswith("hf://") else (source,):
+        if s:
+            msg = msg.replace(s, "<source>")
+    return msg
+
+
+def _folder_source(src: str, version: str, sha: str | None) -> Path | None:
+    p = Path(src[7:] if src.startswith("file://") else src).expanduser()
+    if src.startswith("hf://") or not (p / "manifest.json").is_file():
+        return None
+    p = p.resolve()
+    man = read_manifest(p)
+    if man is None or man.get("version") != version:
+        raise AssetsError(f"the pinned bundle folder holds version {man and man.get('version')}, not {version}")
+    if sha and manifest_sha(p) != sha:
+        raise AssetsError(f"asset manifest {version}: sha256 {manifest_sha(p)} is not the pinned {sha}")
+    if not _verified(p, version, sha):
+        bad = verify(p)
+        if bad:
+            raise AssetsError(f"asset bundle {version}: {len(bad)} files missing or changed (first: {bad[0]})")
+    return p
+
+
+def ensure_pin(pin: dict) -> Path:
+    """The folder of a pinned bundle, pulled from the pin's own source into the cache on first use.
+    The manifest's sha256 must equal the pin's; the source never falls back to env.yaml's (unless the pin is
+    the env.yaml pin itself)."""
+    P = check_pin(pin)
+    v, sha, src, token = P["version"], P["sha256"], P["source"], P["token"]
+    d = local_dir()
+    if d is not None and sha and manifest_sha(d) == sha:
+        return d
+    dest = pin_dir(v, sha)
+    if _verified(dest, v, sha):
+        return dest
+    if not src and _is_default(v, sha):
+        src = pinned()["source"]
+    if not src:
+        raise AssetsError(f"asset bundle {v} is not in the cache and its pin has no source")
+    with _Lock(dest):
+        if _verified(dest, v, sha):
+            return dest
+        try:
+            folder = _folder_source(src, v, sha)
+            return folder if folder is not None else pull(v, src, dest, sha, token)
+        except Exception as e:
+            raise AssetsError(_hide(f"asset bundle {v}: {e}", src, token)) from None
+
+
+def resolve(bundle=None) -> Path:
+    """The bundle folder for None (the env.yaml bundle, pulled if needed), a folder (str or Path) holding
+    manifest.json, or a pin {version, sha256, source}."""
+    if bundle is None:
+        return ensure()
+    if isinstance(bundle, dict):
+        return ensure_pin(bundle)
+    p = Path(bundle).expanduser().resolve()
+    if not (p / "manifest.json").is_file():
+        raise AssetsError(f"{p} is not an asset bundle folder (no manifest.json)")
+    return p
+
+
+def for_scene(scene: dict, *bundles) -> Path:
+    """The bundle a scene came from: the first of the given bundles (folders or pins), then the env.yaml one,
+    whose manifest sha256 equals the scene's env.assets_sha256. A scene without one gets the first candidate."""
+    want = (scene.get("env") or {}).get("assets_sha256") if isinstance(scene, dict) else None
+    tried = []
+    for b in (*bundles, None):
+        try:
+            d = resolve(b)
+        except AssetsError:
+            if b is not None:
+                raise
+            continue
+        if want is None or manifest_sha(d) == want:
+            return d
+        tried.append(d)
+    raise AssetsError(f"the scene is from asset bundle {(scene.get('env') or {}).get('assets_version')} "
+                      f"(sha256 {str(want)[:16]}...), which none of the {len(tried)} given bundles is")

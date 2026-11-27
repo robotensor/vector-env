@@ -98,30 +98,46 @@ class Workers:
 
 
 _workers: Workers | None = None
+_pools: dict[str, Workers] = {}
 _workers_lock = threading.Lock()
 
 
-def workers() -> Workers:
+def workers(bundle=None) -> Workers:
+    """The verifier pool of the env.yaml bundle (bundle=None), or of another bundle (a folder or a pin): one pool
+    per bundle folder."""
     global _workers
+    if bundle is None:
+        with _workers_lock:
+            if _workers is None:
+                _workers = Workers()
+            return _workers
+    d = assets.resolve(bundle)
     with _workers_lock:
-        if _workers is None:
-            _workers = Workers()
-        return _workers
+        if str(d) not in _pools:
+            _pools[str(d)] = Workers(bundle=d)
+        return _pools[str(d)]
 
 
 def reset(p: Workers | None = None) -> None:
     global _workers
     with _workers_lock:
         old, _workers = _workers, p
+        pools = list(_pools.values())
+        _pools.clear()
     if old is not None and old is not p:
         old.close()
+    for w in pools:
+        w.close()
 
 
 def _wire(scene: dict) -> dict:
     missing = [k for k in SCENE_KEYS if k != "scene_id" and k not in scene]
     if missing:
         raise VerifyError(f"the scene lacks {', '.join(missing)}")
-    return {k: scene.get(k) for k in SCENE_KEYS}
+    w = {k: scene.get(k) for k in SCENE_KEYS}
+    if scene.get("target_class") is not None:
+        w["target_class"] = scene["target_class"]
+    return w
 
 
 def _b64(rows) -> str:
@@ -129,32 +145,33 @@ def _b64(rows) -> str:
 
 
 def verify(scene: dict, rows, *, time_limit_s: float, hold: bool = False, claim: dict | None = None, every: int = 1,
-           marks: bool = False, timeout: float | None = 120) -> dict:
+           marks: bool = False, timeout: float | None = 120, bundle=None) -> dict:
     msg = {"op": "verify", "scene": _wire(scene), "rows": _b64(rows), "time_limit_s": float(time_limit_s),
            "hold": bool(hold), "every": int(every), "marks": bool(marks)}
     if claim:
         msg["claim"] = claim
-    return workers().call(msg, timeout=timeout)
+    return workers(bundle).call(msg, timeout=timeout)
 
 
-def verify_result(scene: dict, result: dict, *, time_limit_s: float) -> dict:
+def verify_result(scene: dict, result: dict, *, time_limit_s: float, bundle=None) -> dict:
     claim = {"outcome": result["outcome"]} if result.get("outcome") else {}
     if result.get("action_hash") and result.get("rows_sent") is not None and result.get("rows_sent") == result.get("n"):
         claim["action_hash"] = result["action_hash"]
-    return verify(scene, result.get("ctrl") or "", time_limit_s=time_limit_s, hold=True, claim=claim or None, every=0)
+    return verify(scene, result.get("ctrl") or "", time_limit_s=time_limit_s, hold=True, claim=claim or None, every=0,
+                  bundle=bundle)
 
 
-def probe(scene: dict, ticks: int = 40, every: int = 5) -> dict:
-    r = workers().call({"op": "probe", "scene": _wire(scene), "ticks": int(ticks), "every": int(every)})
+def probe(scene: dict, ticks: int = 40, every: int = 5, bundle=None) -> dict:
+    r = workers(bundle).call({"op": "probe", "scene": _wire(scene), "ticks": int(ticks), "every": int(every)})
     if not r.get("ok"):
         raise VerifyError(r.get("detail") or r.get("reason") or "probe failed")
     r.pop("ok", None)
     return r
 
 
-def prepare(scene: dict) -> bool:
-    return bool(workers().call({"op": "prepare", "scene": _wire(scene)}).get("ok"))
+def prepare(scene: dict, bundle=None) -> bool:
+    return bool(workers(bundle).call({"op": "prepare", "scene": _wire(scene)}).get("ok"))
 
 
-def pin() -> dict:
-    return workers().call({"op": "pin"})
+def pin(bundle=None) -> dict:
+    return workers(bundle).call({"op": "pin"})

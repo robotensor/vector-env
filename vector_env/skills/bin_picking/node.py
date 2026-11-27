@@ -27,7 +27,7 @@ class NodeProc:
     def __init__(self, script: str, bundle: Path, env: dict | None = None):
         self.script = str(_script(script))
         self.bundle = str(bundle)
-        self.env = {**os.environ, "VECTOR_ENV_BUNDLE": self.bundle, **(env or {})}
+        self.env = {**os.environ, "VECTOR_ENV_BUNDLE": self.bundle, "VECTOR_SIM_BUNDLE": self.bundle, **(env or {})}
         self.lock = threading.Lock()
         self.p: subprocess.Popen | None = None
 
@@ -84,12 +84,13 @@ _local = threading.local()
 
 
 def sim(bundle: Path) -> NodeProc:
+    """This thread's simulator process for one bundle folder (one process per bundle and thread)."""
     procs = getattr(_local, "procs", None)
     if procs is None:
         procs = _local.procs = {}
-    key = str(bundle)
+    key = str(Path(bundle).resolve())
     if key not in procs:
-        procs[key] = NodeProc("sim.mjs", bundle)
+        procs[key] = NodeProc("sim.mjs", Path(key))
     return procs[key]
 
 
