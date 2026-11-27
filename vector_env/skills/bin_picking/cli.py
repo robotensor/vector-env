@@ -21,7 +21,7 @@ class EvalError(RuntimeError):
 
 
 def draw_scenes(n: int, seed: int, draw: dict | None = None, log=_err, *, workers: int = 1, cache=None,
-                stats: dict | None = None) -> tuple[list[dict], list[int]]:
+                stats: dict | None = None, bundle=None) -> tuple[list[dict], list[int]]:
     from . import scenes
     from .compose import SceneError
     from .node import close_thread_sims
@@ -36,7 +36,7 @@ def draw_scenes(n: int, seed: int, draw: dict | None = None, log=_err, *, worker
             hit = cache.get(seed, i)
             if hit is not None:
                 return hit[0], hit[1], True
-        sc, err = scenes.draw_index(seed, i, draw)
+        sc, err = scenes.draw_index(seed, i, draw, bundle=bundle)
         if cache is not None:
             cache.put(seed, i, sc, err)
         return sc, err, False
@@ -105,9 +105,31 @@ def draw_scenes(n: int, seed: int, draw: dict | None = None, log=_err, *, worker
     return scs, skipped
 
 
+def bundle_args(p) -> None:
+    g = p.add_argument_group("asset bundle (default: the one env.yaml pins)")
+    g.add_argument("--bundle", metavar="DIR", help="use this bundle folder")
+    g.add_argument("--assets-version", metavar="V", help="use this bundle version (pulled into the cache if needed)")
+    g.add_argument("--assets-sha256", metavar="SHA", help="its manifest sha256 (a pull is refused if it differs)")
+    g.add_argument("--assets-source", metavar="SRC", help="where to pull it from: hf://<repo>[@rev], a pack folder "
+                   "or a bundle folder")
+
+
+def bundle_of(a):
+    if getattr(a, "bundle", None) and getattr(a, "assets_version", None):
+        raise EvalError("give --bundle or --assets-version, not both")
+    if getattr(a, "bundle", None):
+        return Path(a.bundle)
+    if getattr(a, "assets_version", None):
+        return {"version": a.assets_version, "sha256": a.assets_sha256, "source": a.assets_source}
+    if getattr(a, "assets_sha256", None) or getattr(a, "assets_source", None):
+        raise EvalError("--assets-sha256 and --assets-source need --assets-version")
+    return None
+
+
 def cmd_scene(a) -> int:
     from . import scenes
-    sc = scenes.generate(a.seed, json.loads(a.draw) if a.draw else None)
+    b = bundle_of(a)
+    sc = scenes.generate(a.seed, json.loads(a.draw) if a.draw else None, **({} if b is None else {"bundle": b}))
     if a.summary:
         m = sc["meta"]
         json.dump({"scene_id": sc["scene_id"], "seed": sc["seed"], "target": sc["target"], "state_hash": sc["state_hash"],
@@ -118,7 +140,7 @@ def cmd_scene(a) -> int:
     return 0
 
 
-def scene_cache(root, draw: dict | None = None):
+def scene_cache(root, draw: dict | None = None, bundle=None):
     from . import assets, scenes
     if root is False:
         return None
@@ -126,14 +148,14 @@ def scene_cache(root, draw: dict | None = None):
     if d is None:
         return None
     try:
-        env = scenes.env_info(assets.ensure())
+        env = scenes.env_info(assets.resolve(bundle))
     except assets.AssetsError:
         return None
     return scenes.SceneCache(d, env, draw)
 
 
 def write_traces(trace_dir: str | Path, scs: list[dict], results: list[dict], *, time_limit_s: float, workers: int = 1,
-                 log=_err) -> list[Path]:
+                 log=_err, bundle=None) -> list[Path]:
     from . import harness
     from .node import close_thread_sims
     folder = Path(trace_dir)
@@ -158,7 +180,7 @@ def write_traces(trace_dir: str | Path, scs: list[dict], results: list[dict], *,
                 sc, r = scs[i], results[i]
                 p = harness.scene_file(folder, i, sc, "json")
                 try:
-                    tr = harness.trace(sc, r["ctrl"], r["n"], time_limit_s=time_limit_s, result=r)
+                    tr = harness.trace(sc, r["ctrl"], r["n"], time_limit_s=time_limit_s, result=r, bundle=bundle)
                     p.write_text(json.dumps(tr, separators=(",", ":")))
                 except Exception as e:
                     with lock:
@@ -196,30 +218,35 @@ def write_traces(trace_dir: str | Path, scs: list[dict], results: list[dict], *,
 def evaluate(expert: dict, n: int, seed: int, *, workers: int = 1, time_limit_s: float | None = None,
              wall_s: float | None = None, docker: dict | None = None, draw: dict | None = None, log=_err,
              pull: bool = False, stderr_dir: str | None = None, scene_cache_dir=None,
-             trace_dir: str | None = None) -> dict:
-    from . import harness, rules, scenes
+             trace_dir: str | None = None, bundle=None) -> dict:
+    from . import assets, harness, rules, scenes
     from .settings import env_config
-    task = rules.task(time_limit_s if time_limit_s is not None else rules.defaults()["time_limit_s"])
+    if bundle is not None:
+        bundle = assets.resolve(bundle)
+    mode = "pile" if {**env_config()["draw"], **(draw or {})}.get("mode") == "pile" else None
+    task = rules.task(time_limit_s if time_limit_s is not None else rules.defaults(mode)["time_limit_s"])
     wall = float(wall_s if wall_s is not None else env_config()["harness"]["wall_s"])
     t0 = time.time()
-    cache = scene_cache(scene_cache_dir, draw)
+    cache = scene_cache(scene_cache_dir, draw, **({} if bundle is None else {"bundle": bundle}))
     stats = {"cached": 0}
-    scs, skipped = draw_scenes(n, seed, draw, log, workers=workers, cache=cache, stats=stats)
+    scs, skipped = draw_scenes(n, seed, draw, log, workers=workers, cache=cache, stats=stats, bundle=bundle)
     gen_s = time.time() - t0
 
     def show(i, r):
-        log(f"{r['scene_id']}: {r['outcome']} t={r['t']} s rows={r['n']} wall={r['wall_s']} s"
+        picks = (f" picks={r.get('successes')}/{r.get('picks_planned')} outs={r.get('outs')}"
+                 if isinstance(r.get("picks"), list) else "")
+        log(f"{r['scene_id']}: {r['outcome']}{picks} t={r['t']} s rows={r['n']} wall={r['wall_s']} s"
             + (f"  ({r['error']})" if r.get("error") else ""))
 
     t1 = time.time()
     res = harness.run(expert, scs, time_limit_s=task["time_limit_s"], wall_s=wall, workers=workers, docker=docker,
-                      on_result=show, pull=pull, stderr_dir=stderr_dir)
+                      on_result=show, pull=pull, stderr_dir=stderr_dir, bundle=bundle)
     out = harness.summary(res)
     out.update(seed=seed, skipped=skipped, seed_tries=scenes.SEED_TRIES, time_limit_s=task["time_limit_s"], wall_s=wall, workers=workers,
                generate_s=round(gen_s, 1), scenes_cached=stats["cached"], scene_cache=str(cache.dir) if cache else None,
                run_s=round(time.time() - t1, 1))
     if trace_dir:
-        write_traces(trace_dir, scs, res, time_limit_s=task["time_limit_s"], workers=workers, log=log)
+        write_traces(trace_dir, scs, res, time_limit_s=task["time_limit_s"], workers=workers, log=log, bundle=bundle)
     return {"summary": out, "results": res, "scenes": scs}
 
 
@@ -274,7 +301,7 @@ def cmd_run(a) -> int:
     ex = _expert(a)
     r = evaluate(ex, a.scenes, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=_docker(a),
                  draw=json.loads(a.draw) if a.draw else None, pull=a.pull, stderr_dir=a.stderr,
-                 scene_cache_dir=False if a.no_scene_cache else a.scene_cache, trace_dir=a.trace)
+                 scene_cache_dir=False if a.no_scene_cache else a.scene_cache, trace_dir=a.trace, bundle=bundle_of(a))
     return report(r, a.results)
 
 
@@ -316,19 +343,30 @@ def cmd_replay(a) -> int:
     res = pick_result(sc, _read_json(a.result, "result"), a.result)
     if not isinstance(res.get("ctrl"), str) or not isinstance(res.get("n"), int):
         raise EvalError(f"{a.result}: the result has no ctrl/n (use a line of run --results)")
+    if a.time_limit is None:
+        from . import rules
+        a.time_limit = rules.defaults(rules.scene_mode(sc))["time_limit_s"]
     if res.get("scene_id") is None and res.get("state_hash") is None:
         _err("vector-env: warning: the result names no scene_id; it cannot be checked against the scene")
+    from . import assets
+    bundle = bundle_of(a)
+    want = (sc.get("env") or {}).get("assets_sha256")
+    if want and want != assets.manifest_sha(assets.resolve(bundle)):
+        _err(f"vector-env: warning: the scene is from asset bundle {(sc.get('env') or {}).get('assets_version')}, "
+             "not the one in use: give --bundle or --assets-version")
     if not a.trace:
-        print(json.dumps(harness.replay(sc, res["ctrl"], res["n"], time_limit_s=a.time_limit, result=res)))
+        print(json.dumps(harness.replay(sc, res["ctrl"], res["n"], time_limit_s=a.time_limit, result=res, bundle=bundle)))
         return 0
-    tr = harness.trace(sc, res["ctrl"], res["n"], time_limit_s=a.time_limit, result=res)
+    tr = harness.trace(sc, res["ctrl"], res["n"], time_limit_s=a.time_limit, result=res, bundle=bundle)
     try:
         Path(a.trace).write_text(json.dumps(tr, separators=(",", ":")))
     except OSError as e:
         raise EvalError(f"cannot write {a.trace}: {e.strerror or e}") from None
     for line in tr["reasons"]:
         _err(f"why: {line}")
-    print(json.dumps({k: tr[k] for k in ("outcome", "success", "t", "tick", "hash", "detail", "rows", "held")}))
+    keys = ("outcome", "success", "t", "tick", "hash", "detail", "rows", "held", "outs", "out_parts", "tcp_path_m",
+            "joint_path_rad", "crate_hits", "target_class", "picks", "picks_planned", "successes")
+    print(json.dumps({k: tr[k] for k in keys if k in tr}))
     return 0
 
 
@@ -337,6 +375,11 @@ def cmd_assets(a) -> int:
     if a.acmd == "pull":
         pin = assets.pinned()
         v = a.version or pin["version"]
+        if a.sha256:
+            p = {"version": v, "sha256": a.sha256, "source": a.source}
+            print(str(assets.pull(v, a.source, assets.pin_dir(v, a.sha256), a.sha256) if a.force and a.source
+                      else assets.ensure_pin(p)))
+            return 0
         sha = pin["sha256"] if v == pin["version"] else None
         print(str(assets.pull(v, a.source, sha256=sha) if a.force or a.source else assets.ensure(v)))
     elif a.acmd == "dir":
@@ -345,7 +388,8 @@ def cmd_assets(a) -> int:
             raise assets.AssetsError(assets.MISSING)
         print(str(d))
     elif a.acmd == "info":
-        d = assets.bundle_dir()
+        b = bundle_of(a)
+        d = assets.bundle_dir() if b is None else assets.resolve(b)
         out = {"dir": str(d), **assets.info(d), "pinned": assets.pinned()}
         if a.verify:
             bad = assets.verify(d)
@@ -367,6 +411,7 @@ def main(argv: list[str] | None = None, prog: str = "vector-env") -> int:
     s.add_argument("--seed", type=int, required=True)
     s.add_argument("--draw", help="JSON overrides of the random draw")
     s.add_argument("--summary", action="store_true")
+    bundle_args(s)
     r = sub.add_parser("run", help="local evaluation: N random scenes from a seed, run the expert, print the score")
     r.add_argument("--image")
     r.add_argument("--command")
@@ -387,20 +432,26 @@ def main(argv: list[str] | None = None, prog: str = "vector-env") -> int:
     r.add_argument("--scene-cache", metavar="DIR", help="keep generated scenes here (default $VECTOR_ENV_SCENE_CACHE, "
                    "else ~/.cache/vector-env/scenes)")
     r.add_argument("--no-scene-cache", action="store_true", help="generate every scene afresh and keep none")
+    bundle_args(r)
     p = sub.add_parser("replay", help="re-simulate a stored result's controls on its scene")
     p.add_argument("--scene", required=True)
     p.add_argument("--result", required=True, help="a result (JSON), or a run --results file: the line of this scene")
-    p.add_argument("--time-limit", type=float, default=15.0)
+    p.add_argument("--time-limit", type=float, default=None,
+                   help="robot time limit of a pick (default: env.yaml task, by the scene's mode)")
     p.add_argument("--trace", metavar="FILE", help="write the per-tick trace (JSON) here and print why the scene ended")
+    bundle_args(p)
     a = sub.add_parser("assets", help="the asset bundle")
     asub = a.add_subparsers(dest="acmd", required=True)
     ap_pull = asub.add_parser("pull", help="download and verify the pinned (or given) bundle version")
-    ap_pull.add_argument("--version")
-    ap_pull.add_argument("--source")
+    ap_pull.add_argument("--version", "--assets-version", dest="version")
+    ap_pull.add_argument("--sha256", "--assets-sha256", dest="sha256",
+                         help="the manifest sha256 the download must have (another bundle in the same format)")
+    ap_pull.add_argument("--source", "--assets-source", dest="source")
     ap_pull.add_argument("--force", action="store_true")
     asub.add_parser("dir", help="print the bundle folder in use (exit 2 if there is none)")
     ap_info = asub.add_parser("info", help="the bundle in use: version and manifest sha256")
     ap_info.add_argument("--verify", action="store_true", help="check every file's sha256")
+    bundle_args(ap_info)
     ap_man = asub.add_parser("manifest", help="write the bundle's manifest (assets.json)")
     ap_man.add_argument("--version", required=True)
     ap_man.add_argument("--bundle")

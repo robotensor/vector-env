@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { CTRL, b64ToF64, b64encode } from '@vector/sim';
-import { FORMAT, SceneError, setLimit, limits, restore, observation, physState, round, appliedRows } from './env.js';
+import { CTRL, b64ToF64, b64encode, PickRun, Camera } from '@vector/sim';
+import { FORMAT, FORMAT_PICKS, SCENE_DONE, SceneError, setLimit, limits, restore, observation, physState, round, appliedRows, tryMetrics,
+         multiPick, pickStart, sceneSummary } from './env.js';
 
 const STDERR_TAIL = 2000;
 const STDERR_FILE_MAX = 16 << 20;
-export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed', 'policy_unavailable'];
+export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed', 'policy_unavailable',
+                               'physics_error'];
 const IO = { max_line_kib: 1024, max_queued: 4, max_read_mib: 64, max_unread_mib: 16 };
 
 function ioLimits(io) {
@@ -125,7 +127,10 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 class ProtocolError extends Error {}
 
-function parseAct(line, maxRows) {
+export const MAX_ABS = 100;
+export const SAFETY_S = 14400;
+
+function parseAct(line, maxRows, maxAbs = MAX_ABS) {
   let m = line;
   if (typeof line === 'string') {
     try { m = JSON.parse(line); } catch { throw new ProtocolError(`not JSON: ${line.slice(0, 120)}`); }
@@ -139,6 +144,7 @@ function parseAct(line, maxRows) {
   for (const r of rows) {
     if (!Array.isArray(r) || r.length !== CTRL || !r.every((x) => typeof x === 'number' && Number.isFinite(x)))
       throw new ProtocolError(`a row is ${CTRL} finite numbers (6 joint targets in rad, grip 0..1)`);
+    for (const x of r) if (Math.abs(x) > maxAbs) throw new ProtocolError(`a row value ${x} is outside -${maxAbs}..${maxAbs}`);
   }
   return { rows, obs: m.obs === true };
 }
@@ -186,23 +192,43 @@ export class Session {
                  error: null, exchanges: 0, action_hash: EMPTY_ACTION_HASH, rows_sent: 0 };
     this.hash = new ActionHash();
     this.wait = [];
+    // the row count of every accepted act in order, the rows dropped after a verdict, the expert's time per pick (ms)
+    this.actRows = [];
+    this.dropped = [];
+    this.expertMs = [];
     this.sim = [];
     this.verdict = null;
     this.ended = false;
     this.cells = cells;
+    this.maxAbs = Number(job.max_abs) > 0 ? Number(job.max_abs) : MAX_ABS;
   }
 
   _done(outcome, error = null) {
-    const res = this.res;
+    const res = this.res, ep = this.ep;
+    if (this.run) {
+      const S = sceneSummary(this.run);
+      for (const p of S.picks) if (p.outcome === null) p.outcome = outcome;
+      Object.assign(res, S, { target_class: this.sc.target_class ?? null });
+      res.t = S.t;
+      res.tick = S.tick;
+    } else {
+      Object.assign(res, tryMetrics(ep ? (ep.cur || ep.lastTry || {}).mon : null));
+      res.target_class ??= this.sc.target_class ?? null;
+    }
     res.outcome = outcome;
-    res.success = outcome === 'success';
+    res.success = this.run ? res.successes === res.picks_planned : outcome === 'success';
     res.error = error;
     res.infra = INFRA_OUTCOMES.includes(outcome);
     res.wall_s = round((performance.now() - this.t0) / 1000, 3);
     res.action_hash = this.hash.hex();
     res.rows_sent = this.hash.rows;
+    res.act_rows = this.actRows.slice();
+    res.dropped_ctrl = this.dropped.length ? b64encode(new Uint8Array(Float64Array.from(this.dropped.flat()).buffer)) : '';
+    res.expert_s = round(this.expertMs.reduce((a, b) => a + (b || 0), 0) / 1000);
+    if (this.run) for (const p of res.picks) p.expert_s = round((this.expertMs[p.pick] || 0) / 1000);
     this.ended = true;
     this.close();
+    if (this.camera) { this.camera.dispose(); this.camera = null; }
     return res;
   }
 
@@ -218,19 +244,54 @@ export class Session {
     const cell = this.cell;
     this.lim = limits(cell);
     this.tickS = cell.meta.tick_s;
-    const start = { type: 'start', format: FORMAT, scene: { scene_id: sc.scene_id ?? null, xml: sc.xml, meta: sc.meta },
+    const multi = multiPick(cell);
+    const start = { type: 'start', format: multi ? FORMAT_PICKS : FORMAT, scene: { scene_id: sc.scene_id ?? null, xml: sc.xml, meta: sc.meta },
                     checkpoint: sc.checkpoint, state_hash: sc.state_hash, target: sc.target,
                     tick: 0, t: 0, ...physState(cell), obs: observation(cell, { rgb: job.rgb !== false }), limits: this.lim };
     this.res.setup_s = round((performance.now() - this.t0) / 1000, 3);
-    this.ep.beginTry(sc.target);
+    if (multi) {
+      // several picks: the rows of the whole scene, in order; the run chooses each next target
+      this.camera = new Camera(cell);
+      this.run = new PickRun(this.ep, { ...pickStart(cell, sc), camera: this.camera });
+      this.rows = [];
+      Object.assign(start, { pick: 0, picks: this.run.planned });
+      const keys = Object.keys(start);
+      const order = ['type', 'format', 'scene', 'checkpoint', 'state_hash', 'target', 'pick', 'picks'];
+      const sorted = {};
+      for (const k of [...order, ...keys.filter((x) => !order.includes(x))]) sorted[k] = start[k];
+      this.run.start();
+      return { start: sorted };
+    }
+    this.ep.beginTry(sc.target, sc.target_class ?? null);
     return { start };
   }
 
   elapsedS() { return (performance.now() - this.t0) / 1000; }
 
+  // the expert's own time left (ms): its pick's wall budget, and the scene's (wall_s x picks)
+  expertLeftMs(wallS) {
+    const k = this.run ? Math.max(0, this.run.k) : 0, P = this.run ? this.run.planned : 1;
+    const total = this.expertMs.reduce((a, b) => a + (b || 0), 0);
+    return { k, ms: Math.min(1000 * wallS - (this.expertMs[k] || 0), 1000 * wallS * P - total) };
+  }
+
+  // the expert's wait for a message it never answered (the scene ended first), counted in its pick's expert time
+  addWait(ms) {
+    if (!Number.isFinite(ms) || this.ended) return;
+    const k = this.run ? Math.max(0, this.run.k) : 0;
+    this.expertMs[k] = (this.expertMs[k] || 0) + Math.max(0, ms);
+  }
+
   _ctrlSoFar() {
     const ep = this.ep, res = this.res;
     if (!ep) return;
+    if (this.run) {
+      const flat = Float64Array.from(this.rows.flat());
+      res.ctrl = flat.length ? b64encode(new Uint8Array(flat.buffer)) : '';
+      res.n = this.rows.length;
+      res.ctrl_applied = flat.length ? b64encode(new Uint8Array(appliedRows(this.cell, flat).buffer)) : '';
+      return;
+    }
     if (ep.lastTry) { res.ctrl = ep.lastTry.seg.ctrl; res.n = ep.lastTry.ticks; }
     else if (ep.cur) { res.n = ep.cur.ticks; res.ctrl = Buffer.from(Float64Array.from(ep.cur.ctrl).buffer).toString('base64'); }
     res.ctrl_applied = res.ctrl ? b64encode(new Uint8Array(appliedRows(this.cell, b64ToF64(res.ctrl)).buffer)) : '';
@@ -241,16 +302,22 @@ export class Session {
   act(msg, waitMs) {
     if (this.ended) throw new Error('the session has ended');
     const ep = this.ep, cell = this.cell;
-    if (Number.isFinite(waitMs)) this.wait.push(waitMs);
+    if (Number.isFinite(waitMs)) {
+      this.wait.push(waitMs);
+      const k = this.run ? Math.max(0, this.run.k) : 0;
+      this.expertMs[k] = (this.expertMs[k] || 0) + Math.max(0, waitMs);
+    }
     this.res.exchanges++;
+    if (this.run) return this._actPicks(msg);
     let act;
     try {
-      act = parseAct(msg, this.lim.max_rows - ep.cur.ticks);
+      act = parseAct(msg, this.lim.max_rows - ep.cur.ticks, this.maxAbs);
     } catch (e) {
       if (e instanceof ProtocolError) return { result: this.stop('expert_error', e.message) };
       throw e;
     }
     this.hash.add(act.rows);
+    this.actRows.push(act.rows.length);
     const s0 = performance.now();
     let verdict = null;
     if (act.rows.length === 0) {
@@ -258,7 +325,10 @@ export class Session {
       if (!row) { row = cell.ctrl().slice(); row[6] = 0; }
       while (!verdict) verdict = ep.stepTry(row);
     } else {
-      for (const row of act.rows) { verdict = ep.stepTry(row); if (verdict) break; }
+      for (let j = 0; j < act.rows.length && !verdict; j++) {
+        verdict = ep.stepTry(act.rows[j]);
+        if (verdict) for (const r of act.rows.slice(j + 1)) this.dropped.push(r);
+      }
     }
     if (!verdict) {
       const state = { type: 'state', tick: ep.cur.ticks, t: round(ep.cur.ticks * this.tickS), ...physState(cell) };
@@ -273,6 +343,56 @@ export class Session {
     this.res.detail = verdict.detail;
     this._stats();
     return { end, result: this._done(verdict.outcome) };
+  }
+
+  // vector-expert/3: the act's rows run in the current pick; at its verdict the rest of the act is dropped (it stays in
+  // the action hash) and the expert gets a pick message, then the next pick's rows; end after the last pick.
+  _actPicks(msg) {
+    const run = this.run, ep = this.ep, cell = this.cell;
+    let act;
+    try {
+      act = parseAct(msg, this.lim.max_rows - ep.cur.ticks, this.maxAbs);
+    } catch (e) {
+      if (e instanceof ProtocolError) return { result: this.stop('expert_error', e.message) };
+      throw e;
+    }
+    this.hash.add(act.rows);
+    this.actRows.push(act.rows.length);
+    const s0 = performance.now();
+    let r = null;
+    const step = (row) => { this.rows.push(row.slice()); return run.step(row); };
+    if (act.rows.length === 0) {
+      let row = this.rows.length ? this.rows[this.rows.length - 1] : null;
+      if (!row) { row = cell.ctrl().slice(); row[6] = 0; }
+      while (!r) r = step(row);
+    } else {
+      for (let j = 0; j < act.rows.length && !r; j++) {
+        r = step(act.rows[j]);
+        if (r) for (const x of act.rows.slice(j + 1)) this.dropped.push(x);
+      }
+    }
+    this.sim.push(performance.now() - s0);
+    if (!r) {
+      const state = { type: 'state', pick: run.k, tick: ep.cur.ticks, t: round(ep.cur.ticks * this.tickS), ...physState(cell) };
+      if (act.obs) state.obs = observation(cell, { rgb: this.job.rgb !== false });
+      return { state };
+    }
+    const rec = r.record;
+    const pick = { type: 'pick', pick: rec.pick, outcome: rec.outcome, t: rec.t, tick: rec.tick, outs: rec.outs,
+                   next: r.next ? { pick: r.next.pick, target: r.next.target } : null, ...physState(cell) };
+    if (r.next) {
+      pick.obs = observation(cell, { rgb: this.job.rgb !== false, camera: this.camera, img: run.lastImage() });
+      return { state: pick };
+    }
+    this._ctrlSoFar();
+    this.res.detail = rec.detail;
+    this._stats();
+    const outcome = rec.outcome === 'physics_error' ? 'physics_error' : SCENE_DONE;
+    const result = this._done(outcome, outcome === 'physics_error' ? rec.detail : null);
+    const end = { type: 'end', outcome, t: result.t, tick: result.tick,
+                  picks: result.picks.map((p) => ({ pick: p.pick, outcome: p.outcome, t: p.t, tick: p.tick, outs: p.outs })),
+                  successes: result.successes, outs: result.outs };
+    return { pick, end, result };
   }
 
   _stats() {
@@ -292,8 +412,12 @@ export class Session {
   }
 }
 
+// job.wall_s is the budget of one pick; a multi-pick scene gets it once per pick.
+// job.wall_s bounds the expert's own time (expert_s) in one pick, and wall_s x picks in the scene; the simulation does
+// not count. job.safety_s bounds the scene's elapsed time: past it the scene is an infra failure (harness_error).
 export async function runJob(cells, job) {
   const wallS = Number(job.wall_s) > 0 ? Number(job.wall_s) : 45;
+  const safetyS = Number(job.safety_s) > 0 ? Number(job.safety_s) : SAFETY_S;
   const graceS = Number(job.grace_s) >= 0 ? Number(job.grace_s) : 2;
   const ss = new Session(cells, job);
   const tail = (ex) => { const t = ex.stderr.trim().split('\n').slice(-5).join(' | '); return t ? ': ' + t : ''; };
@@ -302,20 +426,26 @@ export async function runJob(cells, job) {
   const opened = ss.open();
   if (opened.result) return opened.result;
   const ex = new Expert(job.expert.argv, job.expert.env, job.expert.cwd, job.io, job.expert.stderr_file);
-  let timedOut = false;
-  const wallMs = Math.max(0, 1000 * (wallS - ss.elapsedS()));
   let timer;
-  const wall = new Promise((r) => { timer = setTimeout(() => { timedOut = true; r(null); }, wallMs); });
   try {
     ex.send(opened.start);
     let sent = performance.now();
     for (;;) {
-      const line = await Promise.race([ex.next(), wall]);
+      const left = ss.expertLeftMs(wallS), safe = 1000 * safetyS - (performance.now() - ss.t0);
+      let fired = null;
+      const cap = new Promise((r) => {
+        timer = setTimeout(() => { fired = safe <= left.ms ? 'safety' : 'wall'; r(null); }, Math.max(0, Math.min(left.ms, safe)));
+      });
+      const line = await Promise.race([ex.next(), cap]);
+      clearTimeout(timer);
       const got = performance.now();
-      if (timedOut) {
+      if (fired) {
+        ss.addWait(got - sent);
         await ex.kill(job.expert.kill);
+        if (fired === 'safety') return ss.stop('harness_error', `the scene ran past the harness's safety cap of ${safetyS} s of elapsed time`);
         if (neverStarted()) return ss.stop('start_failed', `the container did not start within ${wallS} s${tail(ex)}`);
-        return ss.stop('wall_timeout', `no verdict within the wall budget of ${wallS} s`);
+        return ss.stop('wall_timeout', `the expert used up its wall budget of ${wallS} s of its own time` +
+                                       (ss.run ? ` in pick ${left.k}` : ''));
       }
       if (line === null) {
         await ex.kill(job.expert.kill);
@@ -332,6 +462,7 @@ export async function runJob(cells, job) {
       }
       clearTimeout(timer);
       if (!out.end) { await ex.kill(job.expert.kill); return out.result; }
+      if (out.pick) ex.send(out.pick);
       ex.send(out.end);
       await ex.finish(graceS, job.expert.kill);
       return out.result;

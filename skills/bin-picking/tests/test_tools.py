@@ -110,7 +110,7 @@ def test_run_flags_reach_the_cache(monkeypatch, capsys, tmp_path):
         {"scene_id": s["scene_id"], "outcome": "missed", "success": False, "t": 1.0, "n": 0, "ctrl": "", "wall_s": 0.1,
          "infra": False} for s in scs])
     d = tmp_path / "c"
-    argv = ["run", "--command", "true", "--scenes", "3", "--seed", "2", "--workers", "3"]
+    argv = ["run", "--draw", '{"mode": "classic"}', "--command", "true", "--scenes", "3", "--seed", "2", "--workers", "3"]
     assert cli.main([*argv, "--scene-cache", str(d)]) == 0
     assert json.loads(capsys.readouterr().out)["scenes_cached"] == 0 and len(list(d.rglob("*.json"))) == 3
     assert cli.main([*argv, "--scene-cache", str(d)]) == 0
@@ -125,7 +125,7 @@ def test_run_flags_reach_the_cache(monkeypatch, capsys, tmp_path):
 def test_run_trace_and_replay_trace(capsys, tmp_path):
     cmd = shlex.join([sys.executable, str(HERE / "fake_expert.py"), "empty"])
     tr, rows = tmp_path / "traces", tmp_path / "r.jsonl"
-    assert cli.main(["run", "--command", cmd, "--scenes", "2", "--seed", "4", "--time-limit", "1", "--workers", "2",
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", cmd, "--scenes", "2", "--seed", "4", "--time-limit", "1", "--workers", "2",
                      "--trace", str(tr), "--results", str(rows)]) == 0
     err = capsys.readouterr().err
     res = [json.loads(x) for x in rows.read_text().splitlines()]
@@ -139,7 +139,7 @@ def test_run_trace_and_replay_trace(capsys, tmp_path):
     assert {"target_first_touch", "target_held", "grip_first_asked", "nearest_mm", "left_bin"} <= set(t["summary"])
     assert t["reasons"][0].startswith(f"{t['outcome']} at tick {t['tick']}")
     i = 1
-    sc, _ = scenes.draw_index(4, i)
+    sc, _ = scenes.draw_index(4, i, {"mode": "classic"})
     (tmp_path / "scene.json").write_text(json.dumps(sc))
     base = ["replay", "--scene", str(tmp_path / "scene.json"), "--result", str(rows), "--time-limit", "1"]
     assert cli.main(base) == 0

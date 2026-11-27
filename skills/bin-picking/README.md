@@ -87,6 +87,32 @@ flowchart LR
   C --> U
 ```
 
+### Other bundles in the same format
+
+An evaluation may use other assets in the same format (`manifest.json`, `library.json`, `library/`, `assets/`,
+`parts/`, `crates/`, `robot/`, `assets.json`). Every scene, run, replay and verify call takes the bundle to use; the
+default is the pinned one above. A caller names another bundle by its folder or by a pin `{version, sha256, source}`:
+
+```bash
+vector-env scene --seed 7 --bundle <folder>
+vector-env run --command "..." --scenes 20 --assets-version <V> --assets-sha256 <SHA> --assets-source <source>
+vector-env replay --scene scene.json --result result.json --bundle <folder>
+vector-env assets pull --version <V> --sha256 <SHA> --source <source>
+vector-env assets info --bundle <folder>
+```
+
+- A pin is pulled from its own source (`hf://<repo>[@rev]`, a pack folder, or a bundle folder) into
+  `VECTOR_ENV_CACHE/<version>~<first 16 hex of sha256>` and reused; a manifest whose sha256 is not the pin's is
+  refused. The pinned bundle of `env.yaml` keeps `VECTOR_ENV_CACHE/<version>`.
+- A scene records the bundle it came from in `env.assets_version` and `env.assets_sha256`; replay it with the same
+  bundle. The scene cache keeps scenes of different bundles in different folders.
+- The draw takes its parts from the bundle's library, whatever its size.
+- An expert sees the same messages for every bundle. In docker the scene's bundle is mounted at `/bundle`; a
+  `--command` expert gets its folder in `VECTOR_SIM_BUNDLE`.
+- In Python, `assets.resolve(bundle)` returns the folder of `None` (the pinned bundle), a folder or a pin; pass
+  `bundle=` to `scenes.generate`, `scenes.draw_index`, `harness.run`, `harness.arun`, `harness.replay`,
+  `harness.trace` and `verifier.verify_result`. One process can use several bundles at once.
+
 ## CLI
 
 Run from the vector-env root. With one skill installed `--skill bin-picking` is not needed.
@@ -95,11 +121,14 @@ Run from the vector-env root. With one skill installed `--skill bin-picking` is 
 vector-env scene --seed 7 [--summary] [--draw JSON]
 vector-env run --command "node skills/bin-picking/example/solve.mjs" --scenes 20 --seed 1 [--workers 4] [--results FILE]
                [--stderr DIR] [--trace DIR] [--scene-cache DIR | --no-scene-cache]
-vector-env run --image ghcr.io/<you>/<repo>@sha256:<digest> --scenes 20 --seed 1 [--pull] [--time-limit 15] [--wall 45]
+vector-env run --image ghcr.io/<you>/<repo>@sha256:<digest> --scenes 20 --seed 1 [--pull] [--time-limit 15] [--wall 120]
                [--cpus 4] [--memory 8g] [--docker docker] [--draw JSON]
 vector-env replay --scene scene.json --result result.json [--time-limit 15] [--trace FILE]
-vector-env assets pull [--version V] [--source S] [--force] | dir | info [--verify] | manifest --version V | pack --out DIR
+vector-env assets pull [--version V] [--sha256 SHA] [--source S] [--force] | dir | info [--verify] | manifest --version V | pack --out DIR
 ```
+
+`scene`, `run`, `replay` and `assets info` also take `--bundle DIR` or `--assets-version V --assets-sha256 SHA
+--assets-source S` (see above).
 
 - `run --results FILE` writes one JSON line per scene (outcome, robot time, the rows sent as `ctrl` and `n`, timings,
   `infra`).
@@ -165,7 +194,7 @@ module objects.
 from vector_env.skills.bin_picking import scenes, harness, rules, assets   # or: from vector_env import scenes, ...
 
 sc, err = scenes.draw_index(7, 0)       # index 0 of seed 7, retried like the round (None, err when no draw places one)
-res = harness.run({"command": ["node", "skills/bin-picking/example/solve.mjs"]}, [sc], time_limit_s=15, wall_s=45)
+res = harness.run({"command": ["node", "skills/bin-picking/example/solve.mjs"]}, [sc], time_limit_s=15, wall_s=120)
 harness.replay(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15)
 harness.trace(sc, res[0]["ctrl"], res[0]["n"], time_limit_s=15, result=res[0])
 ```
@@ -186,20 +215,20 @@ class Channel:
                                                    # replaced it (scenes in flight start again)
     def paused(self) -> bool: ...                  # optional: True while the peer is lost and may come back
 
-res = await harness.arun({"remote": Channel()}, scene_list, time_limit_s=15, wall_s=45, workers=8,
+res = await harness.arun({"remote": Channel()}, scene_list, time_limit_s=15, wall_s=120, workers=8,
                          step_deadline_s=2.0, first_step_deadline_s=10.0, max_restarts=2,
                          restarts_used=None,                                  # restarts per scene so far
                          on_result=cb)                                        # cb(i, r), plain or async
 res = harness.run({"remote": Channel()}, scene_list, ...)                      # no event loop running here
 res = harness.run({"remote": Channel(), "loop": loop}, scene_list, ...)        # from a thread; loop owns the channel
-harness.compare(res, harness.run({"image": ref}, scene_list[:100], time_limit_s=15, wall_s=45))
+harness.compare(res, harness.run({"image": ref}, scene_list[:100], time_limit_s=15, wall_s=120))
 ```
 
 `workers` scenes run at once, each with its own simulator. The harness adds `scene_key` (`"<index>.<restart>"`) to
 every message it sends and routes what comes back by it; messages with an unknown key are dropped. The wait for the
 first `act` after `start` has the first-step deadline (`harness.remote.first_step_deadline_s`, 10 s, time to plan);
 every later wait has the step deadline (`harness.remote.step_deadline_s`, 2 s); the simulator is paused while it
-waits, and the scene's wall budget (`wall_s`, counted from the scene's setup) caps both. While the channel's optional
+waits, and the wall budget (`wall_s` of the expert's own time per pick) caps both. While the channel's optional
 `paused()` (or a `paused` attribute) is true, no deadline and no wall budget runs out: a scene that would time out
 waits until the channel is back, then gets a fresh deadline, so a reconnect (`Reconnected`) restarts it and a close
 (`ChannelClosed`) ends it `disconnected`, never `step_timeout`. On `Reconnected` every scene in flight starts
@@ -214,7 +243,7 @@ A policy service (anything that answers `POST <url>/v1/act` with the body below)
 
 ```python
 res = harness.run({"policy": {"url": "<policy-url>", "token": tok, "calls": 40, "timeout_s": 60,
-                              "episode": "run-1"}}, scene_list, time_limit_s=15, wall_s=45, workers=2)
+                              "episode": "run-1"}}, scene_list, time_limit_s=15, wall_s=120, workers=2)
 ```
 
 For every call the harness posts this body: `meta` limited to `camera`, `config`, `crate`, `net`, `robot`, `table`
@@ -241,6 +270,37 @@ repeated) and returns `{compared, equal, all_equal, mismatched, infra, only_a, o
 a, b, outcome_a, outcome_b, infra}]}`. A scene is equal when both action hashes are there and the same; `infra`
 counts unequal scenes where a side has an infra outcome (re-run those). `harness.action_hash(rows)` hashes rows the
 same way in Python.
+
+### Claims
+
+A result can be handed to someone else as a claim and checked there without running anything:
+
+```python
+claim = harness.wire_result(result, limits)          # the upload form (JSON-ready), scores recomputed with limits
+errors = harness.check_claim(scene, claim, limits)   # [] = it adds up, else what does not (at most 20 lines)
+```
+
+`limits` is `{time_limit_s, picks, max_rows, tick_s, control_hz}` (per pick), optionally `score` (the score
+settings, else env.yaml's) and `max_abs` (100). A claim has `scene_id`, `outcome`, `success`, `error`, `infra`,
+`ctrl`, `n`, `act_rows`, `dropped_ctrl`, `action_hash`, `rows_sent`, `t`, `tick`, `outs`, `out_parts`,
+`tcp_path_m`, `joint_path_rad`, `crate_hits`, `target_class`, `score`, `expert_s`, `wall_s`, and for a pile scene
+`picks` (each `pick`, `target`, `target_class`, `outcome`, `t`, `tick`, `outs`, `out_parts`, `tcp_path_m`,
+`joint_path_rad`, `crate_hits`, `score`, `expert_s`), `picks_planned`, `successes`. `ctrl` holds the rows the
+simulator stepped (base64 float64, `n` rows; `harness.replay(scene, ctrl, n)` replays them), `act_rows` the row count
+of every act in order (0 for an empty act) and `dropped_ctrl` the rows of an act that came after a verdict.
+From these `check_claim` rebuilds the rows the expert sent: an act runs in the current pick until its verdict and
+its other rows are dropped; an empty act holds the last row until the verdict. It checks the scene id, that every
+value is finite and within ±`max_abs`, that at most `picks` × `max_rows` rows were stepped and sent, that
+`action_hash` is the hash of the rows sent and `rows_sent` their count, every pick's fields (its index, a verdict
+outcome, its ticks within `max_rows` and `t` = ticks × `tick_s`, distinct targets with pick 0 on the scene's target,
+the metrics, the pick score), the scene totals, and `score` = `rules.score` of the picks. It cannot see whether the
+outcomes themselves are right: a replay or a re-run of the expert decides that. `harness.encode_rows(rows)` and
+`harness.decode_rows(b64)` convert rows.
+
+Every result has `expert_s`: the expert's own time, the sum over its acts of the time from the message the harness
+sent to the expert's answer (the simulation is not in it; the first act includes the container start). A pile
+scene's picks each have their own `expert_s`, and the scene's is their sum. `harness.summary()` adds `expert_s` and
+`expert_pick_max_s`.
 
 For images: `harness.run(..., pull=True)` pulls a missing image first; `harness.ensure_image(image)`,
 `harness.pull(image)` (always pulls, raising `PullFailed`, `ImageTooLarge` or `DockerUnavailable`, all
@@ -293,13 +353,14 @@ flowchart LR
 ## Outcomes
 
 Every result has `outcome` and `infra`. The pick rules give `success`, `missed`, `slipped`, `knocked_out`,
-`timed_out`, `wrong_part` (`rules.OUTCOMES`). The harness adds two groups (`rules.EXPERT_OUTCOMES`,
+`timed_out`, `wrong_part` (`rules.OUTCOMES`; pile scenes have no `wrong_part`, see the vector-sim README for their
+rules). The harness adds two groups (`rules.EXPERT_OUTCOMES`,
 `rules.INFRA_OUTCOMES`; `INFRA_OUTCOMES` also exported by the JS side):
 
 | outcome | `infra` | meaning |
 |---|---|---|
 | `expert_error` | no | the expert broke the protocol, gave up, exited, or the container exited after it was created |
-| `wall_timeout` | no | no verdict within the scene's wall budget |
+| `wall_timeout` | no | the expert's own time (`expert_s`) in one pick reached `wall_s` (the scene: `wall_s` × picks); the simulation does not count |
 | `step_timeout` | no | remote: no `act` within the first-step deadline (first act) or the step deadline (later acts) |
 | `disconnected` | no | remote: the channel closed, or it reconnected with no restarts left |
 | `image_too_large` | no | the image's manifest (compressed) is above `harness.docker.max_image_gb`, or the pulled image is above `max_unpacked_gb` (it is removed again) |
@@ -308,8 +369,38 @@ Every result has `outcome` and `infra`. The pick rules give `success`, `missed`,
 | `pull_failed` | yes | the manifest could not be read, or `docker pull` failed or ran past `pull_timeout_s` |
 | `start_failed` | yes | the expert command could not be started, or docker never created the container (no `--cidfile` written: daemon error, bad option, image pruned meanwhile) |
 | `scene_error` | yes | the scene does not restore to its state hash (not the expert's doing) |
-| `harness_error` | yes | the harness itself crashed |
+| `harness_error` | yes | the harness itself crashed, or the scene ran past `harness.safety_s` of elapsed time (14400 s, simulation included) |
 | `policy_unavailable` | yes | a policy service did not answer (above); a caller also gives it to a command expert's `expert_error` with `exit_code` 75 (an expert that wraps a policy service, when that service is unavailable) |
+
+Every result also has the try metrics `outs` (parts that ended outside the bin), `out_parts`, `tcp_path_m`,
+`joint_path_rad`, `crate_hits`, `target_class` (`top`, `blocked`, `buried`, `hidden` in a pile scene, else `null`)
+and `score`, the scene score (`rules.score(result, task)`, `null` for an infra outcome):
+
+```
+s      = 1 if outcome == success else 0
+f_time = 1 - time_weight * min(1, t / time_limit_s)
+f_path = 1 - path_weight * min(1, tcp_path_m / path_ref_m)
+score  = s * f_time * f_path - out_unit * (2 ** min(outs, 30) - 1)
+```
+
+The settings are env.yaml `score:` (`rules.task(...)["score"]`); a submission's score is the mean over its counted
+scenes and can be negative. `harness.summary()` adds `counted`, `mean_score`, `picks`, `pick_successes`,
+`pick_outcomes`, `success_rate` (successful picks over planned picks), `mean_t_s` and `outs`.
+
+A pile scene is `rules.scene_picks(scene)` picks in the same bin (env.yaml `task.pile.picks`, 10), each with its own
+time limit (`task.pile.time_limit_s`, 15 s). Its result has `outcome` `done` (the rules ran the scene to its end)
+or the harness outcome that stopped it, `picks` (one entry per pick: `pick`, `target`, `target_class`, `outcome`,
+`t`, `tick`, `outs`, `out_parts`, `tcp_path_m`, `joint_path_rad`, `crate_hits`, `score`), the totals
+`picks_planned`, `successes`, `outs`, `out_parts`, `tcp_path_m`, `joint_path_rad`, `crate_hits`, and `t`, `tick`,
+`n`, `ctrl` over the whole scene. `success` means every planned pick succeeded. Its score:
+
+```
+score = (sum over picks of s_i * f_time_i * f_path_i - out_unit * (2 ** min(outs, 30) - 1)) / picks_planned
+```
+
+with `t_i` the pick's robot time and `outs` the scene's total: 1.0 is every pick at once, one out costs as much as
+one lost pick. A pick stopped by the harness, and picks that never ran, give 0. `physics_error` (the simulation
+diverged) is an infra outcome.
 
 A result whose expert process exited also has `exit_code` (the process's exit code, or the signal name).
 `infra: true` results say nothing about the expert: re-run them rather than score them. Only signals the expert
@@ -335,9 +426,10 @@ flowchart TD
   S -->|"protocol"| O["rules outcome / expert_error / wall_timeout"]
 ```
 
-## vector-expert/2
+## vector-expert/2 and /3
 
-One JSON object per line on the expert's stdin and stdout.
+One JSON object per line on the expert's stdin and stdout. Pile scenes use `vector-expert/3` (several picks per
+scene, below); every other scene uses `vector-expert/2`.
 
 ```
 -> {"type":"start","format":"vector-expert/2","scene":{scene_id,xml,meta},"checkpoint","state_hash","target",
@@ -366,9 +458,35 @@ One JSON object per line on the expert's stdin and stdout.
   value clamped to its actuator `ctrlrange` and the grip to 0..1, `-0` as `0`. `ctrl` and `action_hash` stay the rows
   the expert sent.
 - `rows: []` holds the last row until the rules decide. `"obs": true` adds an image to the next state.
+- `obs.depth` is uint16 little-endian (units of `camera.depth_unit`); `obs.seg` is uint8 per pixel (0 nothing or the
+  table, `i + 1` part i, 254 the crate, 255 the robot), or uint16 little-endian when `obs.seg_dtype` is `"uint16"`
+  (pile scenes: 65534 the crate, 65535 the robot). Read `seg_dtype` with a default of `"uint8"`.
 - `{"type":"error","error":"..."}` gives up. Anything else on stdout ends the scene as `expert_error`.
-- The try ends at the rules' verdict or at `time_limit_s` of robot time (`timed_out`); the scene's wall budget ends
-  it as `wall_timeout`.
+- The try ends at the rules' verdict or at `time_limit_s` of robot time (`timed_out`). The wall budget counts only
+  the expert's own time (from each message to its answer): `wall_s` per pick, `wall_s` × picks per scene; past it the
+  scene ends `wall_timeout`. The elapsed time of a scene, simulation included, is capped by `harness.safety_s`
+  (14400 s); past it the scene ends `harness_error`, an infra outcome.
+- Every kind (command, docker, remote, policy) holds row values to ±`harness.remote.max_abs` (100); a larger value
+  ends the scene `expert_error`.
+
+`vector-expert/3` (pile scenes) is the same, with several picks in one scene:
+
+```
+-> {"type":"start","format":"vector-expert/3",...,"target","pick":0,"picks":P,...,"limits":{...}}
+-> {"type":"state","pick","tick","t","qpos","qvel","obs"?}
+-> {"type":"pick","pick":k,"outcome","t","tick","outs","next":{"pick":k+1,"target"}|null,"qpos","qvel","obs"}
+-> {"type":"end","outcome":"done","t","tick","picks":[{pick,outcome,t,tick,outs}],"successes","outs"}
+```
+
+- Each pick is one try on its target with its own `limits.time_limit_s` and `limits.max_rows`; `tick` and `t` in
+  `state` and `pick` count within the pick. The robot goes on from where it is: there is no reset between picks.
+- After a pick's verdict the rows left in that act are dropped (they still count in the action hash) and the expert
+  gets a `pick` message: the pick's outcome, its outs, and the next pick's target with the state and an image. The
+  expert answers it with `act` like any state. After the last pick (or when no target is left) `pick` has
+  `next: null` and `end` follows.
+- Between picks, a picked target and every part outside the bin are taken away; a part that a pick failed on stays
+  and is never a target again.
+- The action hash covers every row of the scene, in order; the wall budget is `harness.wall_s` of the expert's own time per pick.
 - What an expert writes is bounded: a message is at most 1 MiB, at most 4 messages wait unanswered, at most 64 MiB
   in all, and it may leave at most 16 MiB of its input unread. Past any of these the scene ends as `expert_error`
   (`harness.io` in `vector_env/skills/bin_picking/env.yaml`).

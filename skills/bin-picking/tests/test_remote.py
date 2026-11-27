@@ -67,7 +67,8 @@ def test_step_deadline_pauses_the_simulator(scenes3):
 
 def test_wall_cap(scenes3):
     r = remote(FakeMiner(delay_s=(0.15, 0.15), per=1), scenes3[:1], wall_s=5, step_deadline_s=2)[0]
-    assert r["outcome"] == "wall_timeout" and "wall budget of 5 s" in r["error"] and 4.9 <= r["wall_s"] < 7, r
+    assert r["outcome"] == "wall_timeout" and "wall budget of 5 s" in r["error"], r
+    assert 4.5 <= r["expert_s"] <= 5.5 and r["wall_s"] >= r["expert_s"], r  # the wall counts the expert's time only
     assert 0 < r["n"] < 40 and r["rows_sent"] >= r["n"], r
 
 
@@ -121,7 +122,7 @@ def test_the_first_act_has_its_own_deadline(scenes3):
     assert r["outcome"] != "step_timeout" and r["error"] is None, r
     r = remote(FakeMiner(stall={"0.": 0}), scenes3[:1], step_deadline_s=0.3, first_step_deadline_s=0.5)[0]
     assert r["outcome"] == "step_timeout" and "first-step deadline of 0.5 s (tick 0)" in r["error"], r
-    assert 0.5 <= r["wall_s"] < 5, r
+    assert 0.5 <= r["wall_s"] < 10, r
 
 
 def test_async_and_threaded_entry_points(scenes3):

@@ -20,7 +20,7 @@ def scenes3():
     from vector_env import scenes
     if assets.find() is None:
         pytest.skip(assets.MISSING)
-    return [scenes.generate(s) for s in (1, 2, 3)]
+    return [scenes.generate(s, {"mode": "classic"}) for s in (1, 2, 3)]
 
 
 @pytest.fixture(scope="session")

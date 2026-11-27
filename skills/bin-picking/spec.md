@@ -31,9 +31,13 @@ These names and their behaviour are unchanged (old and new import paths, see the
   `docker_defaults`, `docker_check`, `ensure_image`, `pull`, `image_size`, `manifest_size`, `remove_image`,
   `prepare`, `scene_file`, `stderr_path`, `check_replay`, `CTRL`, `EMPTY_ACTION_HASH`, `HarnessError`,
   `DockerUnavailable`, `ImageMissing`, `PullFailed`, `ImageTooLarge`, `ReplayMismatch`, `ChannelClosed`,
-  `Reconnected`.
-- `rules`: `OUTCOMES`, `EXPERT_OUTCOMES`, `INFRA_OUTCOMES`, `HARNESS_OUTCOMES`, `defaults`, `task`.
-- `assets`: `find`, `ensure`, `bundle_dir`, `cache_root`, `info`, `pull`, `pack`, `write_manifest`, `MISSING`,
+  `Reconnected`; added for claims: `check_claim`, `wire_result`, `claim_task`, `encode_rows`, `decode_rows`,
+  `CLAIM_KEYS`, `CLAIM_PICK_KEYS`. Every result gains `act_rows`, `dropped_ctrl` and `expert_s` (pile picks too).
+- `rules`: `OUTCOMES`, `EXPERT_OUTCOMES`, `INFRA_OUTCOMES`, `HARNESS_OUTCOMES`, `defaults`, `task`; added for pile
+  scenes: `PILE_OUTCOMES`, `TARGET_CLASSES`, `METRICS`, `SCENE_DONE` (`done`), `scene_mode`, `scene_picks`,
+  `defaults(mode)`, `score_settings`, `score`, `pick_score`; `INFRA_OUTCOMES` gains `physics_error`.
+- `assets`: `find`, `ensure`, `bundle_dir`, `cache_root`, `info`, `pull`, `pack`, `write_manifest`, `resolve`,
+  `ensure_pin`, `check_pin`, `pin_dir`, `for_scene`, `MISSING`,
   `AssetsError`, `ROOT`, `FORMAT`; logger name `vector_env.assets`.
 - `verifier`: `verify`, `verify_result`, `probe`, `prepare`, `pin`, `rows_hash`, `chain_seed`, `chain_next`,
   `reset`, `FORMAT`, `CHAIN_FORMAT`.
@@ -54,6 +58,10 @@ Module-level names that callers patch stay module-level and are read at call tim
   first does not exist; the process's working folder is `<js_dir>`.
 - The bundle is found as before: `VECTOR_ENV_BUNDLE` (or `VECTOR_SIM_BUNDLE`), `<ROOT>/bundle`, then
   `VECTOR_ENV_CACHE/<version>` (default `~/.cache/vector-env/assets/<version>`).
+- A call that names another bundle (`bundle=` a folder or a pin `{version, sha256, source}`) uses only that one; a
+  pin's cache folder is `VECTOR_ENV_CACHE/<version>~<sha256[:16]>`. Node processes get the folder in
+  `VECTOR_ENV_BUNDLE` and `VECTOR_SIM_BUNDLE`; there is one simulator process per bundle and thread and one verifier
+  pool per bundle.
 - `settings` reads `env.yaml` and `config.yaml` from `HERE`; `build/cell.py` reads `build/materials.yaml` beside it.
 - `build.SOURCES` names modules relative to the `build` package (`.usd`, `.demo`); `build/units.py` re-executes
   `python -m vector_env.skills.bin_picking.build` with `ROOT` on `PYTHONPATH`. Its "give its input with --src"
@@ -77,11 +85,19 @@ Module-level names that callers patch stay module-level and are read at call tim
   VECTOR_SIM_REF=bin-picking-expert-r1`; fetches vector-sim at the ref into `/vector-sim` and runs `npm ci` in its
   `js/`; `WORKDIR /x/skills/bin-picking/example`; copies `package.json`, `package-lock.json` and `*.mjs`; `npm ci
   --omit=dev`; `ENV VECTOR_SIM_BUNDLE=/bundle HOME=/tmp`; `USER 65534:65534`; `ENTRYPOINT ["node", "solve.mjs"]`.
-- `solve.mjs` is unchanged: it sends the same rows for the same messages.
+- `solve.mjs` sends the same rows for the same messages; it also runs the `vector-expert/3` loop (on each `pick`
+  message with a next pick it sends the same blind motion again, from the arm's pose in that message).
 
 ## 6. Protocols
 
-- `vector-expert/2`: unchanged (messages, limits, action hash, docker command).
+- `vector-expert/2`: unchanged (messages, limits, action hash, docker command) for every scene that is not a pile.
+- `vector-expert/3`: pile scenes (`meta.config.rules.mode == "pile"`), several picks per scene, as the README says:
+  `start` gains `pick`/`picks`, `state` gains `pick`, a `pick` message follows each pick's verdict, `end` (outcome
+  `done`) follows the last. `max_rows` and the row budget are per pick; the wall budget is `wall_s` of expert time per pick (`wall_s` × picks per scene; `harness.safety_s` caps elapsed time, infra); the
+  action hash covers every row of the scene. Results add `picks` and the scene totals; `replay`, `trace` and the
+  verifier replay the whole scene from its concatenated rows (a pick ends at its verdict, the next row starts the
+  next pick).
+- Policy calls of a `/3` scene: after a `pick` message the call count starts again and `target` is the next pick's.
 - Policy calls: the body is `episode`, `call`, `call_in_try`, `meta` (only `camera`, `config`, `crate`, `net`,
   `robot`, `table`, `tick_s`), `target`, `obs`, `qpos` (robot joints only) and `state`. Answers and outcomes are
   unchanged.

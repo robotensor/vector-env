@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, INFRA_OUTCOMES, TRACE_FORMAT, Session, actionHash, EMPTY_ACTION_HASH, ctrlRanges, appliedRows } from '../src/index.js';
+import { Cells, cellKey, settle, restore, replayCtrl, traceCtrl, matQuat, runJob, limits, setLimit, FORMAT, observation, INFRA_OUTCOMES, TRACE_FORMAT, Session, actionHash, EMPTY_ACTION_HASH, ctrlRanges, appliedRows } from '../src/index.js';
 import { b64ToF64 } from '@vector/sim';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -157,6 +157,8 @@ test('a session steps acts given one by one, like a run', { skip: SKIP }, async 
   bad.act({ type: 'act', rows: [q, q] });
   const e = bad.act({ type: 'act', rows: [[1, 2]] });
   assert.deepEqual([e.result.outcome, e.result.rows_sent, e.result.n], ['expert_error', 2, 2]);
+  assert.deepEqual([e.result.act_rows, e.result.expert_s], [[2], 0], 'a rejected act is not counted; no wait given');
+  assert.equal(out.result.expert_s, 0.04);
   const late = new Session(cells, { scene: sc, time_limit_s: 2 });
   late.open();
   const s = late.stop('step_timeout', 'late');
@@ -176,8 +178,8 @@ test('a result carries the rows the simulator applied, clamped to the actuator r
   const ss = new Session(cells, { scene: sc, time_limit_s: 2 });
   const { start } = ss.open();
   const q = [...sc.meta.robot.arm_joints_qpos.map((i) => start.qpos[i]), 0];
-  const wild = [q[0], 9, q[2], q[3], -0, q[5], -1e6];
-  const loud = [...q.slice(0, 6), 1e300];
+  const wild = [q[0], 9, q[2], q[3], -0, q[5], -50];
+  const loud = [...q.slice(0, 6), 50];
   let out, k = 0;
   do { out = ss.act({ type: 'act', rows: [k % 2 ? loud : wild] }, 1); k++; } while (out.state);
   const res = out.result, lim = ctrlRanges(cells.get(sc));
@@ -190,4 +192,85 @@ test('a result carries the rows the simulator applied, clamped to the actuator r
   assert.equal(ap[13], 1);
   assert.ok(Object.is(ap[4], 0));
   assert.deepEqual(Array.from(appliedRows(cells.get(sc), Float64Array.from(q))), q);
+  const far = new Session(cells, { scene: sc, time_limit_s: 2 });
+  far.open();
+  const e = far.act({ type: 'act', rows: [[...q.slice(0, 6), 1e6]] }, 1);
+  assert.deepEqual([e.result.outcome, e.result.rows_sent], ['expert_error', 0]);
+  assert.match(e.result.error, /outside -100\.\.100/);
+});
+
+test('pile scenes: settle names the target class, results carry the metrics, seg is uint16', { skip: SKIP }, async () => {
+  const pile = { ...base, meta: { ...base.meta, config: { ...base.meta.config, rules: { ...base.meta.config.rules, mode: 'pile', picks: 1 } } } };
+  const s = settle(cells.get(pile), 3);
+  assert.ok(['top', 'blocked', 'buried', 'hidden'].includes(s.target_class), JSON.stringify(s.class_counts));
+  assert.ok(s.class_counts[s.target_class] > 0);
+  const old = settle(cells.get(base), 3);
+  assert.ok(!('target_class' in old) && !('class_counts' in old), 'old scenes settle as before');
+  assert.equal(s.state_hash, old.state_hash);
+  const sc = { scene_id: 'p11', xml: pile.xml, meta: pile.meta, checkpoint: s.checkpoint, state_hash: s.state_hash, target: s.target,
+               target_class: s.target_class };
+  const r = await runJob(cells, { scene: sc, expert: fake('hold'), time_limit_s: 2, wall_s: 30 });
+  assert.deepEqual([r.outcome, r.picks.length, r.picks[0].outcome], ['done', 1, 'timed_out']);
+  assert.deepEqual([r.outs, r.out_parts, r.crate_hits, r.target_class], [0, [], 0, s.target_class]);
+  assert.ok(r.tcp_path_m >= 0 && r.joint_path_rad >= 0);
+  const rp = replayCtrl(cells.get(sc), sc, r.ctrl, r.n, 2);
+  assert.deepEqual([rp.outcome, rp.tick, rp.outs, rp.picks[0].target_class, rp.tcp_path_m], [r.outcome, r.tick, 0, s.target_class, r.tcp_path_m]);
+  const tr = traceCtrl(cells.get(sc), sc, r.ctrl, r.n, 2);
+  assert.deepEqual([tr.outcome, tr.outs, tr.picks[0].target_class], ['done', 0, s.target_class]);
+  const sp = new Session(cells, { scene: sc, time_limit_s: 2 }), o = sp.open().start.obs;
+  sp.close();
+  assert.equal(o.seg_dtype, 'uint16');
+  assert.equal(Buffer.from(o.seg, 'base64').length, 2 * o.width * o.height);
+  const so = new Session(cells, { scene: scene(), time_limit_s: 2 }), oo = so.open().start.obs;
+  so.close();
+  assert.ok(!('seg_dtype' in oo));
+  assert.equal(Buffer.from(oo.seg, 'base64').length, oo.width * oo.height);
+  const c = await runJob(cells, { scene: scene(), expert: fake('hold'), time_limit_s: 2, wall_s: 30 });
+  assert.deepEqual([c.outs, c.crate_hits, c.target_class], [0, 0, null], 'old scenes report the metrics too');
+});
+
+test('vector-expert/3: a pile scene is several picks; pick messages, the end, the result and the replay agree', { skip: SKIP }, () => {
+  const meta = JSON.parse(JSON.stringify(base.meta));
+  Object.assign(meta.config.rules, { mode: 'pile', picks: 3, target: { min_px: 10, buried_min_px: 5 } });
+  const pile = { ...base, meta };
+  const s = settle(cells.get(pile), 3);
+  const sc = { scene_id: 'mp', xml: pile.xml, meta, checkpoint: s.checkpoint, state_hash: s.state_hash, target: s.target,
+               target_class: s.target_class };
+  const ss = new Session(cells, { scene: sc, time_limit_s: 1 });
+  const { start } = ss.open();
+  assert.deepEqual([start.format, start.pick, start.picks, start.limits.max_rows], ['vector-expert/3', 0, 3, 20]);
+  assert.ok(!('target_class' in start));
+  const q = [...meta.robot.arm_joints_qpos.map((i) => start.qpos[i]), 0];
+  const seen = [];
+  let out, k = 0;
+  for (;;) {
+    out = ss.act({ type: 'act', rows: [q, q, q, q, q] }, 1);
+    k++;
+    if (out.state && out.state.type === 'state') { assert.equal(out.state.pick, seen.length); continue; }
+    const p = out.state || out.pick;
+    seen.push(p);
+    assert.equal(p.type, 'pick');
+    if (p.next) {
+      assert.deepEqual(Object.keys(p.next), ['pick', 'target']);
+      assert.equal(p.obs.seg_dtype, 'uint16');
+      const fresh = observation(ss.cell);
+      assert.equal(p.obs.depth, fresh.depth, 'depth'); assert.equal(p.obs.seg, fresh.seg, 'seg'); assert.equal(p.obs.rgb, fresh.rgb, 'rgb');
+    }
+    if (out.end) break;
+  }
+  assert.deepEqual(seen.map((p) => [p.pick, p.outcome, p.tick, p.next && p.next.pick]), [[0, 'timed_out', 20, 1], [1, 'timed_out', 20, 2], [2, 'timed_out', 20, null]]);
+  const { end, result: r } = out;
+  assert.deepEqual([end.outcome, end.tick, end.picks.length, end.successes], ['done', 60, 3, 0]);
+  assert.equal(r.action_hash, actionHash(Array.from({ length: 5 * k }, () => q)), 'the hash covers every row sent');
+  assert.deepEqual([r.outcome, r.n, r.tick, r.t, r.picks_planned, r.successes, r.rows_sent], ['done', 60, 60, 3, 3, 0, 5 * k]);
+  assert.deepEqual([r.act_rows, r.dropped_ctrl], [Array(k).fill(5), ''], 'every act\'s row count, nothing dropped');
+  assert.deepEqual([r.picks.map((p) => p.expert_s), r.expert_s], [[0.004, 0.004, 0.004], 0.012], 'expert time per pick');
+  assert.deepEqual(r.picks.map((p) => p.target), [sc.target, seen[0].next.target, seen[1].next.target]);
+  const rp = replayCtrl(cells.get(sc), sc, r.ctrl, r.n, 1);
+  assert.deepEqual([rp.outcome, rp.tick, rp.picks.map((p) => p.target)], ['done', 60, r.picks.map((p) => p.target)]);
+  const stopped = new Session(cells, { scene: sc, time_limit_s: 1 });
+  stopped.open();
+  for (let j = 0; j < 5; j++) stopped.act({ type: 'act', rows: [q, q, q, q, q] }, 1);
+  const st = stopped.stop('wall_timeout', 'late');
+  assert.deepEqual([st.outcome, st.picks.length, st.picks[1].outcome, st.picks[1].tick, st.n], ['wall_timeout', 2, 'wall_timeout', 5, 25]);
 });

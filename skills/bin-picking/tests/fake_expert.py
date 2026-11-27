@@ -28,7 +28,7 @@ for line in sys.stdin:
     if m["type"] == "start":
         arm = m["scene"]["meta"]["robot"]["arm_joints_qpos"]
         q = [m["qpos"][i] for i in arm] + [0.0]
-        assert m["format"] == "vector-expert/2" and m["obs"]["width"] > 0 and m["limits"]["max_rows"] > 0
+        assert m["format"] in ("vector-expert/2", "vector-expert/3") and m["obs"]["width"] > 0 and m["limits"]["max_rows"] > 0
         if mode == "crash":
             sys.exit(3)
         if mode == "junk":
@@ -58,6 +58,9 @@ for line in sys.stdin:
             continue
     if mode == "obs" and m["type"] == "state" and not asked:
         sys.exit(0 if "obs" in m and m["obs"]["depth"] else 4)
+    if mode == "big":
+        send({"type": "act", "rows": [[0.0] * 6 + [150.0]]})
+        continue
     if mode == "track":
         send({"type": "act", "rows": track(m, arm, per)})
     elif mode == "empty":

@@ -11,14 +11,14 @@ from vector_env import cli
 @needs_bundle
 def test_run_prints_the_score(capsys):
     cmd = shlex.join([sys.executable, str(HERE / "fake_expert.py"), "empty"])
-    assert cli.main(["run", "--command", cmd, "--scenes", "2", "--seed", "4", "--time-limit", "3", "--workers", "2"]) == 0
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", cmd, "--scenes", "2", "--seed", "4", "--time-limit", "3", "--workers", "2"]) == 0
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["scenes"] == 2 and out["score"] == 0.0 and out["time_limit_s"] == 3
 
 
 @needs_bundle
 def test_scene_summary(capsys):
-    assert cli.main(["scene", "--seed", "2", "--summary"]) == 0
+    assert cli.main(["scene", "--draw", '{"mode": "classic"}', "--seed", "2", "--summary"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["seed"] == 2 and out["parts"] >= 1 and out["env"]["assets_sha256"]
 
@@ -71,7 +71,7 @@ def test_run_skips_an_index_whose_draws_place_no_scene(monkeypatch, capsys):
         return [{"scene_id": s["scene_id"], "outcome": "missed", "success": False, "t": 1.0, "n": 20, "wall_s": 0.1,
                  "error": None, "infra": False} for s in scs]
     monkeypatch.setattr(harness, "run", run)
-    assert cli.main(["run", "--command", "true", "--scenes", "4", "--seed", "5"]) == 0
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", "true", "--scenes", "4", "--seed", "5"]) == 0
     cap = capsys.readouterr()
     out = json.loads(cap.out.strip().splitlines()[-1])
     assert out["skipped"] == [1] and out["scenes"] == 3 and out["seed_tries"] == 6
@@ -86,7 +86,7 @@ def test_a_broken_generator_is_one_line(monkeypatch, capsys):
     def gen(seed, draw):
         raise SimError("sim.mjs stopped")
     monkeypatch.setattr(scenes, "generate", gen)
-    assert cli.main(["run", "--command", "true", "--scenes", "3"]) == 2
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", "true", "--scenes", "3"]) == 2
     err = capsys.readouterr().err.strip().splitlines()
     assert err[-1].startswith("vector-env: the scene generator does not work here")
 
@@ -94,16 +94,16 @@ def test_a_broken_generator_is_one_line(monkeypatch, capsys):
         from vector_env.compose import SceneError
         raise SceneError("could not place the drawn parts")
     monkeypatch.setattr(scenes, "generate", nothing)
-    assert cli.main(["scene", "--seed", "9"]) == 2
+    assert cli.main(["scene", "--draw", '{"mode": "classic"}', "--seed", "9"]) == 2
     assert "no valid scene" in capsys.readouterr().err
-    assert cli.main(["run", "--command", "true", "--scenes", "2"]) == 2
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", "true", "--scenes", "2"]) == 2
     assert "none of the 2 indexes" in capsys.readouterr().err
 
 
 def test_image_without_docker_is_not_a_score(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "draw_scenes", lambda n, seed, draw=None, log=None, **k: (_fake_scenes(n), []))
     rows = tmp_path / "r.jsonl"
-    assert cli.main(["run", "--image", "ghcr.io/a/b:1", "--docker", str(tmp_path / "no-docker"), "--scenes", "2",
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--image", "ghcr.io/a/b:1", "--docker", str(tmp_path / "no-docker"), "--scenes", "2",
                      "--results", str(rows)]) == 2
     cap = capsys.readouterr()
     assert cap.out == "" and "docker_unavailable" in cap.err and "--command" in cap.err and "not a score" in cap.err
@@ -149,7 +149,7 @@ def test_replay_refuses_a_result_of_another_scene(monkeypatch, capsys, tmp_path)
 @needs_bundle
 def test_documented_eval_does_not_crash(capsys):
     cmd = shlex.join([sys.executable, str(HERE / "fake_expert.py"), "empty"])
-    assert cli.main(["run", "--command", cmd, "--scenes", "7", "--seed", "1", "--time-limit", "0.5", "--workers", "4"]) == 0
+    assert cli.main(["run", "--draw", '{"mode": "classic"}', "--command", cmd, "--scenes", "7", "--seed", "1", "--time-limit", "0.5", "--workers", "4"]) == 0
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["scenes"] + len(out["skipped"]) == 7
 

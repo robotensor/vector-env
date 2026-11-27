@@ -1,6 +1,6 @@
 # Example expert
 
-An almost blind `vector-expert/2` expert for bin-picking: the message loop with the harness, packaged as an image.
+An almost blind `vector-expert/2` and `/3` expert for bin-picking: the message loop with the harness, packaged as an image.
 It reads only the arm's start pose, lowers the arm a little, closes the gripper and goes back up, the same motion
 for every scene. It never looks at the parts or the target, so most scenes end without a pick (score about 0). Copy
 it and replace `plan()` with your own.
@@ -23,6 +23,9 @@ flowchart TD
 3. **Sending.** It answers `start` and every `state` with the next `EXPERT_CHUNK` rows (20) and `obs: false`. When
    the rows are used up it sends an `act` with no rows, and the harness holds the last row until the verdict.
    An exception is sent as `{"type": "error"}`; `end` stops the program.
+4. **Picks** (`vector-expert/3`, pile scenes: several picks per scene). On a `pick` message with a `next` pick it
+   makes the same rows again from the arm's pose in that message and sends them the same way; the next target is
+   `msg.next.target`.
 
 The rows depend only on the messages, never on a clock, so the expert is deterministic. To plan a real pick, build
 the cell from `start.scene` with `@vector/sim` (installed by `package.json`), solve the poses with its IK and check

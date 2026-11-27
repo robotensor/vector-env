@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import sys
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import HERE, ROOT, fake
 
-from vector_env import harness
+from vector_env import harness, rules
 
 EXAMPLE = {"command": ["node", str(ROOT / "skills" / "bin-picking" / "example" / "solve.mjs")]}
 RESULT_KEYS = {"scene_id", "outcome", "success", "t", "ctrl", "n", "wall_s", "error"}
@@ -25,6 +26,39 @@ def test_the_example_expert_runs_over_several_scenes(scenes3):
         assert (rp["outcome"], rp["success"], rp["t"]) == (r["outcome"], r["success"], r["t"])
     s = harness.summary(res)
     assert s["scenes"] == 3 and s["successes"] == sum(r["success"] for r in res), s
+    for r in res:
+        assert {"outs", "out_parts", "tcp_path_m", "joint_path_rad", "crate_hits", "target_class", "score"} <= set(r), r
+        assert r["score"] == rules.score(r, rules.task(15))
+    assert s["counted"] == 3 and s["outs"] == sum(r["outs"] for r in res)
+    assert s["mean_score"] == round(sum(r["score"] for r in res) / 3, 6)
+
+
+def test_scene_score_and_summary():
+    t = rules.task(30)
+    assert t["score"] == {"time_weight": 0.5, "path_weight": 0.0, "path_ref_m": 3.0, "out_unit": 1.0}
+    assert rules.score({"outcome": "success", "t": 0, "outs": 0}, t) == 1.0
+    assert rules.score({"outcome": "success", "t": 15, "outs": 0}, t) == 0.75
+    assert rules.score({"outcome": "success", "t": 99, "outs": 0}, t) == 0.5
+    assert rules.score({"outcome": "success", "t": 15, "outs": 3}, t) == 0.75 - 7
+    assert rules.score({"outcome": "timed_out", "t": 30, "outs": 1}, t) == -1.0
+    assert rules.score({"outcome": "slipped", "t": 3, "outs": 0}, t) == 0.0
+    assert rules.score({"outcome": "expert_error", "outs": 2}, t) == -3.0
+    assert rules.score({"outcome": "harness_error"}, t) is None
+    assert rules.score({"outcome": "knocked_out", "outs": 99}, t) == -(2 ** 30 - 1)
+    p = rules.task(30, score={"path_weight": 0.2, "path_ref_m": 2.0})
+    assert rules.score({"outcome": "success", "t": 0, "tcp_path_m": 1.0}, p) == 0.9
+    assert rules.score({"outcome": "success", "t": 0, "tcp_path_m": 5.0}, p) == 0.8
+    with pytest.raises(ValueError):
+        rules.task(30, score={"time_weight": 2})
+    assert rules.defaults("pile")["time_limit_s"] == 15 and rules.defaults()["time_limit_s"] == 15
+    res = [{"outcome": "success", "success": True, "t": 6.0, "outs": 0, "score": 0.9},
+           {"outcome": "timed_out", "success": False, "t": 30.0, "outs": 2, "score": -3.0},
+           {"outcome": "harness_error", "success": False, "t": 0.0, "infra": True, "score": None}]
+    s = harness.summary(res)
+    assert (s["counted"], s["mean_score"], s["success_rate"], s["mean_t_s"], s["outs"]) == (2, -1.05, 0.5, 18.0, 2), s
+    f = harness._fail({"scene_id": "x", "target_class": "hidden"}, "expert_error", "boom", 0.0)
+    assert (f["outs"], f["out_parts"], f["crate_hits"], f["target_class"], f["score"]) == (0, [], 0, "hidden", 0.0), f
+    assert harness._fail({}, "harness_error", "x", 0.0)["score"] is None
 
 
 def test_robot_time_limit_and_pipe_overhead(scene):
@@ -192,3 +226,157 @@ def test_image_size_limit_before_and_after_pull(scene, tmp_path, monkeypatch):
         harness.pull("fake:flaky", D)
     assert harness.remove_image("fake:hold-20", D) and harness.image_size("fake:hold-20", D) is None
     assert harness.manifest_size("fake:hold-20", D) == G // 2
+
+
+def _picks_scene(scene, picks=3):
+    sc = copy.deepcopy(scene)
+    sc["meta"]["config"]["rules"].update(mode="pile", picks=picks, target={"min_px": 10, "buried_min_px": 5})
+    sc["scene_id"] = scene["scene_id"] + "-picks"
+    return sc
+
+
+def test_a_multi_pick_scene_runs_replays_and_scores(scene):
+    from vector_env import verifier
+    sc = _picks_scene(scene)
+    assert rules.scene_picks(sc) == 3 and rules.scene_picks(scene) == 1
+    r = harness.run(fake("hold"), [sc], time_limit_s=1, wall_s=20)[0]
+    assert (r["outcome"], r["picks_planned"], len(r["picks"]), r["n"], r["tick"], r["t"]) == ("done", 3, 3, 60, 60, 3.0), r
+    assert [p["pick"] for p in r["picks"]] == [0, 1, 2] and r["picks"][0]["target"] == sc["target"]
+    assert len({p["target"] for p in r["picks"]}) == 3, "a failed target is not chosen again"
+    assert all(p["outcome"] == "timed_out" and p["score"] == 0.0 for p in r["picks"])
+    assert r["score"] == rules.score(r, rules.task(1)) == 0.0 and r["successes"] == 0 and not r["success"]
+    rp = harness.replay(sc, r["ctrl"], r["n"], time_limit_s=1)
+    assert (rp["outcome"], rp["tick"], [p["target"] for p in rp["picks"]]) == ("done", 60, [p["target"] for p in r["picks"]])
+    tr = harness.trace(sc, r["ctrl"], r["n"], time_limit_s=1, result=r)
+    assert tr["outcome"] == "done" and len(tr["ticks"]) == 60 and tr["reasons"][0].startswith("done after 3 of 3 picks")
+    v = verifier.verify_result(sc, r, time_limit_s=1)
+    assert v["ok"] and v["outcome"] == "done" and len(v["picks"]) == 3, v
+    s = harness.summary([r])
+    assert (s["picks"], s["pick_successes"], s["pick_outcomes"]) == (3, 0, {"timed_out": 3})
+    ex = harness.run(EXAMPLE, [sc], time_limit_s=6, wall_s=20)[0]
+    assert ex["outcome"] == "done" and len(ex["picks"]) == 3 and ex["error"] is None, ex
+    late = harness.run(fake("sleep"), [sc], time_limit_s=15, wall_s=0.6)[0]
+    assert late["outcome"] == "wall_timeout" and "in pick 0" in late["error"] and late["wall_s"] >= 0.6, late
+    assert late["picks"] and late["picks"][-1]["outcome"] == "wall_timeout" and late["picks"][0]["expert_s"] >= 0.6
+
+
+def test_the_wall_budget_counts_only_the_experts_time_and_the_safety_cap_is_infra(scene, monkeypatch):
+    # a fast expert over 300 ticks: far more elapsed time than its wall budget, all of it simulation
+    r = harness.run(fake("hold", "10"), [scene], time_limit_s=15, wall_s=0.3)[0]
+    assert r["outcome"] == "timed_out" and r["expert_s"] < 0.3 < r["wall_s"], r
+    monkeypatch.setattr(harness, "safety_s", lambda: 0.5)
+    r = harness.run(fake("sleep"), [scene], time_limit_s=15, wall_s=30)[0]
+    assert (r["outcome"], r["infra"], r["score"]) == ("harness_error", True, None) and "safety cap" in r["error"], r
+
+
+def test_row_values_beyond_max_abs_end_the_scene_for_every_kind(scene):
+    r = harness.run(fake("big"), [scene], time_limit_s=15, wall_s=30)[0]
+    assert r["outcome"] == "expert_error" and "outside -100..100" in r["error"], r
+
+
+def test_multi_pick_score():
+    t = rules.task(30)
+    picks = [{"outcome": "success", "t": 15.0, "outs": 0}, {"outcome": "missed", "t": 30.0, "outs": 1}] + \
+        [{"outcome": "success", "t": 0.0, "outs": 0}] * 8
+    r = {"outcome": "done", "picks": picks, "picks_planned": 10, "outs": 1}
+    assert rules.score(r, t) == round((0.75 + 8 - 1) / 10, 6)
+    assert rules.score({**r, "outs": 0, "picks": [{"outcome": "success", "t": 0.0}] * 10}, t) == 1.0
+    assert rules.score({**r, "outs": 2, "picks": picks[:3]}, t) == round((0.75 + 1 - 3) / 10, 6)
+    assert rules.score({"outcome": "physics_error", "picks": [], "picks_planned": 10}, t) is None
+
+
+def _limits(scene, time_limit_s, **kw):
+    t = rules.task(time_limit_s)
+    return {"time_limit_s": t["time_limit_s"], "picks": rules.scene_picks(scene), "max_rows": t["max_rows"],
+            "tick_s": t["tick_s"], "control_hz": t["control_hz"], **kw}
+
+
+def _claim(r, lim):
+    return json.loads(json.dumps(harness.wire_result(r, lim)))
+
+
+def test_claims_of_real_runs_pass_the_cheap_check(scene):
+    sc = _picks_scene(scene)
+    runs = [(sc, fake("hold"), 1), (sc, fake("empty"), 1), (sc, EXAMPLE, 6), (scene, EXAMPLE, 15)]
+    for s, ex, tl in runs:
+        r = harness.run(ex, [s], time_limit_s=tl, wall_s=30)[0]
+        lim = _limits(s, tl)
+        c = _claim(r, lim)
+        assert set(harness.CLAIM_KEYS) <= set(c) and "ctrl_applied" not in c
+        assert harness.check_claim(s, c, lim) == [], (r["outcome"], harness.check_claim(s, c, lim))
+        assert r["expert_s"] > 0 and r["rows_sent"] == sum(r["act_rows"])
+        if r.get("picks"):
+            assert all(p["expert_s"] >= 0 for p in r["picks"])
+            assert abs(sum(p["expert_s"] for p in r["picks"]) - r["expert_s"]) < 1e-5
+    # the empty acts hold: stepped rows without sent rows
+    r = harness.run(fake("empty"), [sc], time_limit_s=1, wall_s=30)[0]
+    assert (r["act_rows"], r["rows_sent"], r["n"]) == ([0, 0, 0], 0, 60)
+    s = harness.summary([r])
+    assert s["expert_s"] == round(r["expert_s"], 3) and s["expert_pick_max_s"] == max(p["expert_s"] for p in r["picks"])
+
+
+def test_check_claim_rejects_what_does_not_add_up(scene):
+    sc = _picks_scene(scene)
+    r = harness.run(fake("hold", "4"), [sc], time_limit_s=1, wall_s=30)[0]
+    lim = _limits(sc, 1)
+    good = _claim(r, lim)
+    assert harness.check_claim(sc, good, lim) == []
+
+    def bad(change, *, limits=lim, scene_=sc):
+        c = copy.deepcopy(good)
+        change(c)
+        errs = harness.check_claim(scene_, c, limits)
+        assert errs, "a tampered claim passed"
+        return " | ".join(errs)
+
+    assert "scene_id" in bad(lambda c: c.update(scene_id="other"))
+    assert "action_hash" in bad(lambda c: c.update(action_hash="0" * 16))
+    assert "score" in bad(lambda c: c.update(score=1.0))
+    assert "pick 1 score" in bad(lambda c: c["picks"][1].update(score=0.5))
+    rows = harness.decode_rows(good["ctrl"])
+    rows[5][2] += 0.25
+    assert "action_hash" in bad(lambda c: c.update(ctrl=harness.encode_rows(rows)))
+    rows[5][2] = 1e6
+    assert "within" in bad(lambda c: c.update(ctrl=harness.encode_rows(rows)))
+    assert "n = " in bad(lambda c: c.update(n=c["n"] - 1))
+    assert "rows_sent" in bad(lambda c: c.update(rows_sent=c["rows_sent"] + 1))
+    assert "act" in bad(lambda c: c["act_rows"].append(3))
+    assert "base64" in bad(lambda c: c.update(ctrl="not base64!"))
+    assert "tick" in bad(lambda c: c["picks"][0].update(tick=c["picks"][0]["tick"] + 1))
+    assert "targets part" in bad(lambda c: c["picks"][2].update(target=c["picks"][1]["target"]))
+    assert "pick 0 target" in bad(lambda c: c["picks"][0].update(target=c["picks"][0]["target"] + 1))
+    assert "out_parts" in bad(lambda c: c["picks"][1].update(outs=1))
+    assert "outs" in bad(lambda c: c.update(outs=2))
+    assert "successes" in bad(lambda c: c.update(successes=1))
+    assert "picks" in bad(lambda c: None, limits={**lim, "picks": 5})
+    assert "not a verdict" in bad(lambda c: c["picks"][0].update(outcome="wall_timeout"))
+    assert "picks" in bad(lambda c: c.pop("picks"))
+    # another score setting: the claim must state the round's formula
+    other = {**lim, "score": {"out_unit": 2.0}}
+    assert harness.check_claim(sc, _claim(r, other), other) == []
+    assert harness.check_claim(sc, good, {**lim, "score": {"time_weight": 0.1}}) == []  # no success: same score
+    # what the cheap check cannot see: a fabricated success with a consistent score (phase 2 re-runs it)
+    c = copy.deepcopy(good)
+    c["picks"][0]["outcome"] = "success"
+    c["successes"] = 1
+    c["picks"][0]["score"] = rules.pick_score(c["picks"][0], rules.score_settings(), 1.0)
+    c["score"] = rules.score(c, harness.claim_task(lim))
+    assert harness.check_claim(sc, c, lim) == []
+    # a harness failure before anything ran is a well-formed claim with no rows and no score
+    f = harness.wire_result(harness._fail(sc, "docker_unavailable", "no docker", 0.0), lim)
+    assert f["score"] is None and harness.check_claim(sc, f, lim) == []
+
+
+def test_claim_rows_walk_rebuilds_the_rows_sent():
+    a, b, c, d = ([float(i)] * 6 + [0.0] for i in range(4))
+    # pick 0: act of 3 rows, verdict on its 2nd (1 dropped); pick 1: empty act held 2 ticks; pick 2: open, 1 row
+    ctrl, dropped = [a, b, b, b, c], [d]
+    sent, why = harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 300)
+    assert why is None and sent == [a, b, d, c]
+    assert harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, True], 300)[1] is None
+    assert "dropped" in harness._walk(ctrl, [], [3, 0, 1], [2, 2, 1], [True, True, False], 300)[1]
+    assert "repeat" in harness._walk([a, b, c, b, c], dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 300)[1]
+    assert "more than" in harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 2)[1]
+    assert "no verdict" in harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, False, False], 300)[1]
+    assert "grip" in harness._walk([[0.0] * 6 + [1.0]] * 2, [], [0], [2], [True], 300)[1]
+    assert harness.decode_rows(harness.encode_rows(ctrl)) == ctrl and harness.encode_rows([]) == ""
