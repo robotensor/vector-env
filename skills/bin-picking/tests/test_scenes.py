@@ -12,7 +12,7 @@ KEYS = {"scene_id", "seed", "xml", "meta", "checkpoint", "state_hash", "target",
 
 
 def test_generate_is_reproducible(scene):
-    again = scenes.generate(1)
+    again = scenes.generate(1, {"mode": "classic"})
     assert set(scene) == KEYS
     assert again["state_hash"] == scene["state_hash"] and again["xml"] == scene["xml"]
     assert again["checkpoint"] == scene["checkpoint"] and again["target"] == scene["target"]
@@ -38,12 +38,13 @@ def test_different_seeds_differ(scenes3):
 
 
 def test_draw_follows_settings():
-    D = scenes.default_draw()
+    assert scenes.default_draw()["mode"] == "pile"
+    D = {**scenes.default_draw(), "mode": "classic"}
     for seed in range(5):
-        st = scenes.settings_for(seed)
+        st = scenes.settings_for(seed, D)
         n = sum(st["parts"].values())
         assert D["count"][0] <= n <= D["count"][1] and 1 <= len(st["parts"]) <= D["kinds"][1]
-        assert st == scenes.settings_for(seed)
+        assert st == scenes.settings_for(seed, D)
 
 
 def test_task_rules():
@@ -73,3 +74,48 @@ def test_composer_refusals():
     with pytest.raises(SceneError, match="0-30 copies|1-30 parts"):
         compose({"parts": {"gear": 31}}, 1)
     assert compose({"parts": {"gear": 2}}, 1)["meta"]["crate"]["id"] == "m"
+
+
+def test_pile_draw():
+    D = scenes.pile_draw()
+    for seed in range(8):
+        st = scenes.settings_for(seed, {"mode": "pile"})
+        assert st == scenes.settings_for(seed, {"mode": "pile"})
+        assert st["mode"] == "pile" and st["crate"] in D["crate"]
+        assert D["level"][0] <= st["level"] <= D["level"][1]
+        assert 1 <= len(st["parts"]) <= D["kinds"][1] and sum(st["parts"].values()) <= D["pool_max"]
+    assert scenes.settings_for(0) == scenes.settings_for(0, {"mode": "pile"}) != scenes.settings_for(0, {"mode": "classic"})
+
+
+def test_pile_draw_repeats_kinds_of_a_small_library(monkeypatch):
+    rows = (("a", 2e-5), ("b", 4e-5), ("c", 3e-5))
+    monkeypatch.setattr(scenes, "_pile_rows", lambda *a: rows)
+    kinds = set()
+    for seed in range(12):
+        st = scenes.settings_for(seed, {"mode": "pile"})
+        assert set(st["parts"]) <= {"a", "b", "c"} and sum(st["parts"].values()) <= 300
+        kinds.add(len(st["parts"]))
+    assert max(kinds) == 3
+
+
+@needs_bundle
+def test_pile_compose():
+    st = scenes.settings_for(4, {"mode": "pile"})
+    sc = compose(st, 4)
+    M = sc["meta"]
+    assert M["fill"]["mode"] == "rain" and M["fill"]["level"] == st["level"]
+    from vector_env.skills.bin_picking.settings import env_config
+    T = env_config()["task"]["pile"]
+    assert M["config"]["rules"]["mode"] == "pile" and M["config"]["rules"]["try_s"] == T["time_limit_s"]
+    assert M["config"]["rules"]["picks"] == T.get("picks", 10)
+    assert M["config"]["physics"]["sleep"] and '<flag sleep="enable"/>' in sc["xml"]
+    bury = (M["fill"].get("bury") or {}).get("parts", [])
+    assert bool(bury) == bool(st.get("bury"))
+    assert len(M["parts"]) == sum(st["parts"].values()) == len(M["fill"]["spawns"]) + len(bury)
+    assert sorted([s["part"] for s in M["fill"]["spawns"]] + bury) == list(range(len(M["parts"])))
+    b = [s["batch"] for s in M["fill"]["spawns"]]
+    assert b[0] == 0 and all(0 <= y - x <= 1 for x, y in zip(b, b[1:]))
+    with pytest.raises(SceneError, match="level"):
+        compose({**st, "level": 0.9}, 4)
+    old = compose({"parts": {"gear": 2}}, 1)
+    assert "sleep" not in old["xml"] and "rain" not in old["meta"]["config"] and "mode" not in old["meta"]["config"]["rules"]

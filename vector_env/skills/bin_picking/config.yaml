@@ -37,6 +37,31 @@ pile:
   fill_ratio_max: 0.55
   stack: {clearance: 0.005, calm_speed: 0.05, calm_max_ticks: 20, settle_max_ticks: 120}
 
+rain:
+  level: 0.58
+  level_range: [0.5, 0.667]
+  level_tol: 0.02
+  count_range: [50, 150]
+  freeze_deep: false
+  freeze_min_depth: 2
+  margin: 0.005
+  gap: 0.004
+  batch_max: 20
+  tries: 40
+  clearance: 0.003
+  drop: 0.01
+  level_cell: 0.01
+  level_q: 0.5
+  batch_min_ticks: 6
+  calm_speed: 0.05
+  calm_max_ticks: 40
+  settle_max_ticks: 200
+  rest_speed: 0.01
+  rest_ticks: 6
+  bury: {parts: 5, ring: 1.0, size: 0.8, wall: 0.005, tries: 12}
+  limits: {parts_total: [1, 150], per_type: [0, 150]}
+  physics: {timestep: 0.002, solver: pgs, iterations: 30, noslip_iterations: 3, sleep: true, sleep_tolerance: 0.015}
+
 limits:
   parts_total: [1, 30]
   per_type: [0, 30]
@@ -85,6 +110,21 @@ rules:
   end_on_miss: false
   inside_above_rim: 0.6
   floor_below: 0.03
+  # pile scenes (rules.mode: pile) only
+  crate_hit_force: 75
+  target:
+    shares: {top: 0.2, blocked: 0.4, buried: 0.25, hidden: 0.15}
+    res: 0.003
+    min_px: 100
+    buried_min_px: 20
+    vis_blocked: 0.6
+    vis_buried: 0.1
+    overlap_px: 3
+    depth_share: 0.1
+    hidden_max_px: 0
+    hidden_vis: 0.05
+    hidden_cam_share: 0.15
+    press_dz: 0.005
 
 camera:
   width: 224

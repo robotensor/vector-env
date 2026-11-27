@@ -12,7 +12,7 @@ import numpy as np
 
 from . import library as assets_index
 from .assets import bundle_dir
-from .settings import cell_config
+from .settings import cell_config, env_config
 
 
 class SceneError(ValueError):
@@ -121,13 +121,37 @@ def capacity_error(area: float, n: int, floor: float, cfg: dict, crate: dict) ->
             f"overlapping, at most {cfg['fill'].get('max_layers', 1)} layers; asked for {n})")
 
 
+def pile_mode(settings: dict) -> bool:
+    return isinstance(settings, dict) and settings.get("mode") == PILE
+
+
+def mode_config(cfg: dict, pile: bool) -> dict:
+    """The cell config of a scene: pile scenes (rain fill) take their limits and physics from `rain:`."""
+    if not pile:
+        return cfg
+    R = cfg["rain"]
+    out = dict(cfg)
+    out["limits"] = {**cfg["limits"], **(R.get("limits") or {})}
+    out["physics"] = {**cfg["physics"], **(R.get("physics") or {})}
+    T = (env_config().get("task") or {}).get("pile") or {}
+    out["rules"] = {**cfg["rules"], "mode": PILE, "try_s": float(T.get("time_limit_s", 15.0)),
+                    "picks": int(T.get("picks", 10))}
+    return out
+
+
 def validate(settings: dict, lib: dict, cfg: dict, bundle: Path | None = None, seed: int = 0, layout: bool = False):
-    L = cfg["limits"]
     bundle = Path(bundle or bundle_dir())
     if not isinstance(settings, dict):
         raise SceneError("settings must be an object")
+    rain = pile_mode(settings)
+    if settings.get("mode") not in (None, PILE):
+        raise SceneError("mode must be 'pile' or left out")
+    cfg = mode_config(cfg, rain)
+    L = cfg["limits"]
     crate = container(settings, lib, cfg)
     pile = crate["kind"] == "pile"
+    if rain and pile:
+        raise SceneError("a pile scene needs a crate")
     what = "the pile zone" if pile else "the crate"
     pose = settings.get("crate_pose") or {}
     dflt = cfg["pile"]["pose"] if pile else {"x": 0.75, "y": 0.0, "yaw_deg": 0.0}
@@ -179,7 +203,7 @@ def validate(settings: dict, lib: dict, cfg: dict, bundle: Path | None = None, s
         used = sum(n * float(np.prod(rows[k]["extents_m"])) for k, n in counts.items())
         if used > float(cfg["pile"]["fill_ratio_max"]) * vol:
             raise SceneError(f"too many parts for {what} ({used / vol:.0%} of its volume)")
-    elif counts:
+    elif counts and not rain:
         sp = float(cfg["fill"]["spacing"]) / 2
         area = sum(n * math.pi * (footprint_r(rows[k]["extents_m"]) + sp) ** 2 for k, n in counts.items())
         floor = 4 * ix * iy
@@ -197,6 +221,17 @@ def validate(settings: dict, lib: dict, cfg: dict, bundle: Path | None = None, s
           "robot_q": [float(v) for v in q]}
     if pile:
         st["pile_half"] = list(crate["inner_half"])
+    if rain:
+        lo, hi = cfg["rain"]["level_range"]
+        try:
+            level = float(settings.get("level", cfg["rain"]["level"]))
+        except (TypeError, ValueError):
+            raise SceneError("level must be a number") from None
+        if not lo <= level <= hi:
+            raise SceneError(f"level: the pile fills {lo:g}-{hi:g} of the crate depth")
+        st["mode"], st["level"] = PILE, level
+        if settings.get("bury"):
+            st["bury"] = True
     if groups:
         st["random"] = groups
     return st, dict(sorted(counts.items())), rows, expansion
@@ -290,10 +325,21 @@ def _random(settings: dict, cfg: dict, bundle: Path, seed: int, rows: dict) -> t
     return norm, out
 
 
-def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool = False) -> dict:
+def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool = False, frozen: dict | None = None) -> dict:
+    """`frozen` (second stage of a freeze_deep pile, see scenes.generate): {"parts": [{type, pose, frozen}], "hidden":
+    index or -1} — the settled parts in this order, frozen ones as static bodies at their pose, the others placed at
+    their pose by a `place` fill."""
     bundle = Path(bundle or bundle_dir()).resolve()
     lib, cfg = library(bundle), config()
-    st, counts, parts, expansion = validate(settings, lib, cfg, bundle, seed, layout=layout)
+    if frozen is None:
+        st, counts, parts, expansion = validate(settings, lib, cfg, bundle, seed, layout=layout)
+    else:
+        st, expansion = copy.deepcopy(settings), []
+        counts, parts = {}, {}
+        for r in frozen["parts"]:
+            counts[r["type"]] = counts.get(r["type"], 0) + 1
+            parts[r["type"]] = asset(r["type"], bundle)
+    cfg = mode_config(cfg, pile_mode(st))
     P, C = cfg["physics"], cfg["cell"]
     crate = container(st, lib, cfg)
 
@@ -312,6 +358,13 @@ def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool 
     if P.get("ls_tolerance") is not None:
         o.ls_tolerance = float(P["ls_tolerance"])
     o.noslip_iterations = int(P.get("noslip_iterations", 0))
+    if P.get("solver"):
+        o.solver = getattr(mujoco.mjtSolver, f"mjSOL_{P['solver'].upper()}")
+    if P.get("multiccd") is False:
+        o.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+    if P.get("sleep"):
+        o.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+        o.sleep_tolerance = float(P["sleep_tolerance"])
     spec.visual.global_.offwidth = 640
     spec.visual.global_.offheight = 480
     G = mujoco.mjtGeom
@@ -334,6 +387,9 @@ def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool 
                            ("crate_wall_py", [ix, tw_y / 2, h], [0, iy + tw_y / 2, fz + h]),
                            ("crate_wall_ny", [ix, tw_y / 2, h], [0, -iy - tw_y / 2, fz + h])):
             cb.add_geom(name=nm, type=G.mjGEOM_BOX, size=sz, pos=ps, rgba=rgba)
+        if P.get("crate_floor"):
+            t = float(P["crate_floor"]) / 2
+            cb.add_geom(name="crate_floor", type=G.mjGEOM_BOX, size=[ix, iy, t], pos=[0, 0, fz - t], rgba=rgba)
 
     meshes, file_sha = {}, {}
     for pid in counts:
@@ -348,14 +404,35 @@ def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool 
         if sha:
             file_sha[f["ray"]] = sha["ray"]
             file_sha.update(zip(f["hulls"], sha["hulls"]))
-    instances = [pid for pid, n in counts.items() for _ in range(n)]
+    instances = ([r["type"] for r in frozen["parts"]] if frozen is not None
+                 else [pid for pid, n in counts.items() for _ in range(n)])
+    still = [bool(r["frozen"]) for r in frozen["parts"]] if frozen is not None else [False] * len(instances)
     pk = C["park"]
     ws = float(P["friction_static_weight"])
     for i, pid in enumerate(instances):
         p = parts[pid]
         g = meshes[p["files"]["ray"]]
         mu = ws * float(p["mu_static"]) + (1.0 - ws) * float(p["mu_dynamic"])
-        b = w.add_body(name=f"part{i}", pos=[pk["x"] - pk["dx"] * i, 0.0, pk["z"]], gravcomp=1.0)
+        if still[i]:
+            pose = frozen["parts"][i]["pose"]
+            b = w.add_body(name=f"part{i}", pos=pose[:3], quat=pose[3:])
+        else:
+            b = w.add_body(name=f"part{i}", pos=[pk["x"] - pk["dx"] * i, 0.0, pk["z"]], gravcomp=1.0)
+        _part_body(b, i, p, g, mu, P, G, still[i])
+    files = sorted({m.file for m in spec.meshes})
+
+    model = spec.compile()
+    xml = spec.to_xml().replace(f' meshdir="{spec.meshdir}"', "")
+    meta = _meta(model, st, crate, instances, parts, cfg, lib, seed, frozen)
+    meta.update(bundle=bundle_hash(bundle), counts=counts, random=expansion, files=files, file_sha256=file_sha,
+                xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
+    if layout:
+        meta["layout"] = True
+    return {"xml": xml, "meta": meta, "settings": st}
+
+
+def _part_body(b, i, p, g, mu, P, G, still: bool) -> None:
+    if not still:
         fj = b.add_freejoint(name=f"part{i}_free")
         if P.get("part_damping"):
             fj.damping = [float(P["part_damping"]), 0.0, 0.0]
@@ -365,23 +442,13 @@ def compose(settings: dict, seed: int, bundle: Path | None = None, layout: bool 
         i_min = float(p["mass"]) * float(P.get("min_inertia_radius", 0.006)) ** 2
         b.mass, b.ipos, b.iquat = p["mass"], p["com"], p["inertia_quat"]
         b.inertia = [max(float(v), i_min) for v in p["inertia"]]
-        b.add_geom(name=f"part{i}_ray", type=G.mjGEOM_MESH, meshname=f"{g}_ray", group=2, contype=0,
-                   conaffinity=0, mass=0, rgba=[0.7, 0.7, 0.7, 1])
-        for k in range(p["hulls"]):
-            b.add_geom(name=f"part{i}_hull{k}", type=G.mjGEOM_MESH, meshname=f"{g}_hull{k}", group=3, contype=1,
-                       conaffinity=1, mass=0, condim=int(P["part_condim"]), priority=int(P["part_priority"]),
-                       friction=[mu, 0.005, 0.0001], solref=P["part_solref"], solimp=P["part_solimp"],
-                       margin=float(P.get("part_margin", 0.0)), gap=float(P.get("part_gap", 0.0)))
-    files = sorted({m.file for m in spec.meshes})
-
-    model = spec.compile()
-    xml = spec.to_xml().replace(f' meshdir="{spec.meshdir}"', "")
-    meta = _meta(model, st, crate, instances, parts, cfg, lib, seed)
-    meta.update(bundle=bundle_hash(bundle), counts=counts, random=expansion, files=files, file_sha256=file_sha,
-                xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
-    if layout:
-        meta["layout"] = True
-    return {"xml": xml, "meta": meta, "settings": st}
+    b.add_geom(name=f"part{i}_ray", type=G.mjGEOM_MESH, meshname=f"{g}_ray", group=2, contype=0,
+               conaffinity=0, mass=0, rgba=[0.7, 0.7, 0.7, 1])
+    for k in range(p["hulls"]):
+        b.add_geom(name=f"part{i}_hull{k}", type=G.mjGEOM_MESH, meshname=f"{g}_hull{k}", group=3, contype=1,
+                   conaffinity=1, mass=0, condim=int(P["part_condim"]), priority=int(P["part_priority"]),
+                   friction=[mu, 0.005, 0.0001], solref=P["part_solref"], solimp=P["part_solimp"],
+                   margin=float(P.get("part_margin", 0.0)), gap=float(P.get("part_gap", 0.0)))
 
 
 def _id(m, kind, name) -> int:
@@ -391,7 +458,7 @@ def _id(m, kind, name) -> int:
     return int(i)
 
 
-def _meta(m, st, crate, instances, parts, cfg, lib, seed) -> dict:
+def _meta(m, st, crate, instances, parts, cfg, lib, seed, frozen=None) -> dict:
     O = mujoco.mjtObj
     R = lib["robot"]
     arm_j = [_id(m, O.mjOBJ_JOINT, n) for n in R["arm_joints"]]
@@ -411,9 +478,13 @@ def _meta(m, st, crate, instances, parts, cfg, lib, seed) -> dict:
     for i, pid in enumerate(instances):
         b = _id(m, O.mjOBJ_BODY, f"part{i}")
         hulls = [_id(m, O.mjOBJ_GEOM, f"part{i}_hull{k}") for k in range(parts[pid]["hulls"])]
-        part_rows.append({"i": i, "type": pid, "body": b, "qpos": int(m.jnt_qposadr[m.body_jntadr[b]]),
-                          "dof": int(m.jnt_dofadr[m.body_jntadr[b]]), "ray_geom": _id(m, O.mjOBJ_GEOM, f"part{i}_ray"),
-                          "hull_geoms": hulls, "radius": parts[pid]["radius"]})
+        j = int(m.body_jntadr[b])
+        row = {"i": i, "type": pid, "body": b, "qpos": int(m.jnt_qposadr[j]) if j >= 0 else -1,
+               "dof": int(m.jnt_dofadr[j]) if j >= 0 else -1, "ray_geom": _id(m, O.mjOBJ_GEOM, f"part{i}_ray"),
+               "hull_geoms": hulls, "radius": parts[pid]["radius"]}
+        if j < 0:
+            row["frozen"] = True
+        part_rows.append(row)
     cp = st["crate_pose"]
     yaw = math.radians(cp["yaw_deg"])
     nsub = int(round(1.0 / cfg["control"]["hz"] / cfg["physics"]["timestep"]))
@@ -434,12 +505,15 @@ def _meta(m, st, crate, instances, parts, cfg, lib, seed) -> dict:
                   "pos": [cp["x"], cp["y"], 0.0 - crate["floor_z"]], "yaw": yaw, "quat": _yaw_quat(yaw)},
         "parts": part_rows,
         "part_types": {pid: _part_type(parts[pid]) for pid in dict.fromkeys(instances)},
-        "fill": _spawns(st, crate, instances, parts, cfg, seed) if crate["kind"] == "pile"
+        "fill": _frozen_fill(frozen, cfg) if frozen is not None
+                else _rain(m, st, crate, part_rows, instances, parts, cfg, seed) if pile_mode(st)
+                else _spawns(st, crate, instances, parts, cfg, seed) if crate["kind"] == "pile"
                 else _place(m, st, crate, part_rows, cfg, seed,
                             {"qpos": [int(m.jnt_qposadr[j]) for j in arm_j], "act": arm_act, "grip": grip_act,
                              "q0": [float(v) for v in st["robot_q"]], "nsub": nsub}),
         "camera": _camera(st, crate, cfg),
-        "config": {k: copy.deepcopy(cfg[k]) for k in ("physics", "control", "fill", "rules", "camera", "cell", "pile")},
+        "config": {k: copy.deepcopy(cfg[k]) for k in ("physics", "control", "fill", "rules", "camera", "cell", "pile")
+                   + (("rain",) if pile_mode(st) else ())},
     }
 
 
@@ -468,6 +542,70 @@ def _spawns(st, crate, instances, parts, cfg, seed) -> dict:
     return {"mode": "stack", "spawns": spawns, "floor_z": 0.0, "clearance": S["clearance"],
             "calm_speed": S["calm_speed"], "calm_max_ticks": S["calm_max_ticks"],
             "settle_max_ticks": S["settle_max_ticks"], "rest_speed": F["rest_speed"], "rest_ticks": F["rest_ticks"]}
+
+
+def _frozen_fill(frozen: dict, cfg: dict) -> dict:
+    R = cfg["rain"]
+    spawns = [{"part": i, "pos": [float(v) for v in r["pose"][:3]], "quat": [float(v) for v in r["pose"][3:]]}
+              for i, r in enumerate(frozen["parts"]) if not r["frozen"]]
+    return {"mode": "place", "spawns": spawns, "settle_max_ticks": R["settle_max_ticks"], "rest_speed": R["rest_speed"],
+            "rest_ticks": R["rest_ticks"], "frozen": sum(bool(r["frozen"]) for r in frozen["parts"]),
+            "hidden_target": int(frozen.get("hidden", -1)), "rain": frozen.get("rain")}
+
+
+def _rain(m, st, crate, part_rows, instances, parts, cfg, seed) -> dict:
+    """Rain schedule: the parts in a random order, split into batches; each batch a set of drop points over the crate
+    floor whose bounding circles do not overlap, each part in a random orientation. The sim drops a batch once the pile
+    is calm and stops when the pile surface reaches `level` of the crate depth. With `bury`, the largest parts stay out of the rain: once it stops,
+    the sim drops them as one tight batch over a `top` part near the centre so it ends under one layer (a `hidden`
+    target), checked with classify and retried from a snapshot."""
+    R = cfg["rain"]
+    rng = np.random.default_rng([int(seed), 0x7A17])
+    order = rng.permutation(len(instances))
+    bury = None
+    if st.get("bury"):
+        B = R["bury"]
+        k = min(int(B["parts"]), max(1, len(order) // 4))
+        c0 = max(range(len(instances)), key=lambda i: (float(parts[instances[i]]["radius"]), -i))
+        big = [c0] + [int(i) for i in order if i != c0][:k - 1]   # the largest part, then the next ones of the rain
+        order = np.array([i for i in order if i not in set(big)], dtype=int)
+        brng = np.random.default_rng([int(seed), 0xB0B])
+        rad = [float(parts[instances[i]]["radius"]) for i in big]
+        reach = 0.5 * rad[0]
+        Rw = _flat(m, part_rows[c0], brng)[0]   # the first part lies flat over its target
+        q0 = np.zeros(4)
+        mujoco.mju_mat2Quat(q0, Rw.reshape(-1))
+        bury = {"parts": [int(i) for i in big], "quats": [[float(v) for v in q0]] + [_rand_quat(brng) for _ in big[1:]], "ring": float(B["ring"]), "size": float(B["size"]),
+                "wall": reach + float(B["wall"]), "tries": int(B["tries"]), "salt": int(brng.integers(1 << 30))}
+    ix, iy = crate["inner_half"]
+    cp = st["crate_pose"]
+    yaw = math.radians(cp["yaw_deg"])
+    c, s = math.cos(yaw), math.sin(yaw)
+    mg, gap, bmax, tries = float(R["margin"]), float(R["gap"]), int(R["batch_max"]), int(R["tries"])
+    spawns, batch, bi = [], [], 0
+    for i in order:
+        r = float(parts[instances[i]]["radius"])
+        mx, my = max(ix - r - mg, 0.005), max(iy - r - mg, 0.005)
+        pos = None
+        if len(batch) < bmax:
+            for _ in range(tries):
+                lx, ly = float(rng.uniform(-mx, mx)), float(rng.uniform(-my, my))
+                if all(math.hypot(lx - x, ly - y) >= r + q + gap for x, y, q in batch):
+                    pos = lx, ly
+                    break
+        if pos is None:
+            bi, batch = bi + 1, []
+            pos = float(rng.uniform(-mx, mx)), float(rng.uniform(-my, my))
+        lx, ly = pos
+        batch.append((lx, ly, r))
+        spawns.append({"part": int(i), "xy": [cp["x"] + c * lx - s * ly, cp["y"] + s * lx + c * ly],
+                       "quat": _rand_quat(rng), "batch": bi})
+    keys = ("clearance", "drop", "level_cell", "level_q", "batch_min_ticks", "calm_speed", "calm_max_ticks",
+            "settle_max_ticks", "rest_speed", "rest_ticks")
+    out = {"mode": "rain", "spawns": spawns, "floor_z": 0.0, "level": float(st["level"]), **{k: R[k] for k in keys}}
+    if bury:
+        out["bury"] = bury
+    return out
 
 
 def _flat(m, p, rng) -> tuple[np.ndarray, float, np.ndarray, float, list]:
