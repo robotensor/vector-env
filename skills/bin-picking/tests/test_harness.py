@@ -282,7 +282,9 @@ def test_multi_pick_score():
     assert rules.score(r, t) == round((0.75 + 8 - 1) / 10, 6)
     assert rules.score({**r, "outs": 0, "picks": [{"outcome": "success", "t": 0.0}] * 10}, t) == 1.0
     assert rules.score({**r, "outs": 2, "picks": picks[:3]}, t) == round((0.75 + 1 - 3) / 10, 6)
-    assert rules.score({"outcome": "physics_error", "picks": [], "picks_planned": 10}, t) is None
+    assert rules.score({"outcome": "physics_error", "picks": [], "picks_planned": 10}, t) == 0.0
+    assert rules.score({"outcome": "physics_error", "outs": 0, "picks_planned": 10,
+                        "picks": [{"outcome": "success", "t": 0.0}, {"outcome": "physics_error", "t": 3.0}]}, t) == 0.1
 
 
 def _limits(scene, time_limit_s, **kw):
@@ -330,18 +332,15 @@ def test_check_claim_rejects_what_does_not_add_up(scene):
         return " | ".join(errs)
 
     assert "scene_id" in bad(lambda c: c.update(scene_id="other"))
-    assert "action_hash" in bad(lambda c: c.update(action_hash="0" * 16))
+    assert "ctrl" not in good and "act_rows" not in good and "dropped_ctrl" not in good
+    assert all(len(p["action_hash"]) == 16 and p["rows_sent"] >= 0 for p in good["picks"])
+    assert sum(p["rows_sent"] for p in good["picks"]) == good["rows_sent"]
+    assert "action_hash" in bad(lambda c: c.update(action_hash="not a hash"))
+    assert "pick 1 action_hash" in bad(lambda c: c["picks"][1].update(action_hash="X" * 16))
     assert "score" in bad(lambda c: c.update(score=1.0))
     assert "pick 1 score" in bad(lambda c: c["picks"][1].update(score=0.5))
-    rows = harness.decode_rows(good["ctrl"])
-    rows[5][2] += 0.25
-    assert "action_hash" in bad(lambda c: c.update(ctrl=harness.encode_rows(rows)))
-    rows[5][2] = 1e6
-    assert "within" in bad(lambda c: c.update(ctrl=harness.encode_rows(rows)))
-    assert "n = " in bad(lambda c: c.update(n=c["n"] - 1))
     assert "rows_sent" in bad(lambda c: c.update(rows_sent=c["rows_sent"] + 1))
-    assert "act" in bad(lambda c: c["act_rows"].append(3))
-    assert "base64" in bad(lambda c: c.update(ctrl="not base64!"))
+    assert "rows_sent" in bad(lambda c: c["picks"][0].update(rows_sent=lim["max_rows"] + 1))
     assert "tick" in bad(lambda c: c["picks"][0].update(tick=c["picks"][0]["tick"] + 1))
     assert "targets part" in bad(lambda c: c["picks"][2].update(target=c["picks"][1]["target"]))
     assert "pick 0 target" in bad(lambda c: c["picks"][0].update(target=c["picks"][0]["target"] + 1))
@@ -367,16 +366,3 @@ def test_check_claim_rejects_what_does_not_add_up(scene):
     assert f["score"] is None and harness.check_claim(sc, f, lim) == []
 
 
-def test_claim_rows_walk_rebuilds_the_rows_sent():
-    a, b, c, d = ([float(i)] * 6 + [0.0] for i in range(4))
-    # pick 0: act of 3 rows, verdict on its 2nd (1 dropped); pick 1: empty act held 2 ticks; pick 2: open, 1 row
-    ctrl, dropped = [a, b, b, b, c], [d]
-    sent, why = harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 300)
-    assert why is None and sent == [a, b, d, c]
-    assert harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, True], 300)[1] is None
-    assert "dropped" in harness._walk(ctrl, [], [3, 0, 1], [2, 2, 1], [True, True, False], 300)[1]
-    assert "repeat" in harness._walk([a, b, c, b, c], dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 300)[1]
-    assert "more than" in harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, True, False], 2)[1]
-    assert "no verdict" in harness._walk(ctrl, dropped, [3, 0, 1], [2, 2, 1], [True, False, False], 300)[1]
-    assert "grip" in harness._walk([[0.0] * 6 + [1.0]] * 2, [], [0], [2], [True], 300)[1]
-    assert harness.decode_rows(harness.encode_rows(ctrl)) == ctrl and harness.encode_rows([]) == ""

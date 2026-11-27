@@ -6,8 +6,7 @@ import { FORMAT, FORMAT_PICKS, SCENE_DONE, SceneError, setLimit, limits, restore
 
 const STDERR_TAIL = 2000;
 const STDERR_FILE_MAX = 16 << 20;
-export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed', 'policy_unavailable',
-                               'physics_error'];
+export const INFRA_OUTCOMES = ['harness_error', 'scene_error', 'docker_unavailable', 'image_missing', 'pull_failed', 'start_failed', 'policy_unavailable'];
 const IO = { max_line_kib: 1024, max_queued: 4, max_read_mib: 64, max_unread_mib: 16 };
 
 function ioLimits(io) {
@@ -196,6 +195,9 @@ export class Session {
     this.actRows = [];
     this.dropped = [];
     this.expertMs = [];
+    // vector-expert/3: the FNV-1a hash and the count of the rows the expert sent while each pick was current
+    this.pickHash = [];
+    this.pickRows = [];
     this.sim = [];
     this.verdict = null;
     this.ended = false;
@@ -225,7 +227,13 @@ export class Session {
     res.act_rows = this.actRows.slice();
     res.dropped_ctrl = this.dropped.length ? b64encode(new Uint8Array(Float64Array.from(this.dropped.flat()).buffer)) : '';
     res.expert_s = round(this.expertMs.reduce((a, b) => a + (b || 0), 0) / 1000);
-    if (this.run) for (const p of res.picks) p.expert_s = round((this.expertMs[p.pick] || 0) / 1000);
+    if (this.run) {
+      for (const p of res.picks) {
+        p.expert_s = round((this.expertMs[p.pick] || 0) / 1000);
+        p.action_hash = this.pickHash[p.pick] ? this.pickHash[p.pick].hex() : EMPTY_ACTION_HASH;
+        p.rows_sent = this.pickRows[p.pick] || 0;
+      }
+    }
     this.ended = true;
     this.close();
     if (this.camera) { this.camera.dispose(); this.camera = null; }
@@ -358,6 +366,9 @@ export class Session {
     }
     this.hash.add(act.rows);
     this.actRows.push(act.rows.length);
+    const k = run.k;
+    (this.pickHash[k] ||= new ActionHash()).add(act.rows);
+    this.pickRows[k] = (this.pickRows[k] || 0) + act.rows.length;
     const s0 = performance.now();
     let r = null;
     const step = (row) => { this.rows.push(row.slice()); return run.step(row); };

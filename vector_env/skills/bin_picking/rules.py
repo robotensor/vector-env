@@ -8,9 +8,11 @@ OUTCOMES = ("success", "missed", "slipped", "knocked_out", "timed_out", "wrong_p
 PILE_OUTCOMES = ("success", "missed", "slipped", "knocked_out", "timed_out", "multi_pick")
 EXPERT_OUTCOMES = ("expert_error", "wall_timeout", "step_timeout", "disconnected", "image_too_large")
 INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed",
-                  "policy_unavailable", "physics_error")
+                  "policy_unavailable")
 # a multi-pick (pile) scene that the rules ran to its end: the outcomes are per pick, in result["picks"]
 SCENE_DONE = "done"
+# a pile scene the simulation could not go on with: it ends there; that pick scores 0, the earlier picks count
+PHYSICS_ERROR = "physics_error"
 PICKS_DEFAULT = 10
 HARNESS_OUTCOMES = EXPERT_OUTCOMES + INFRA_OUTCOMES
 TARGET_CLASSES = ("top", "blocked", "buried", "hidden")
@@ -55,8 +57,13 @@ def score_settings(settings: dict | None = None) -> dict:
     return out
 
 
-def task(time_limit_s: float = 15.0, human_factor: float = 2.0, score: dict | None = None) -> dict:
-    t, h = float(time_limit_s), float(human_factor)
+def task(time_limit_s: float = 15.0, human_factor: float | None = None, score: dict | None = None) -> dict:
+    """The task constants for a per-pick time limit. The human limit is `time_limit_s * human_factor`; without
+    `human_factor` it is env.yaml `task.human_limit_s` (20 s), at least `time_limit_s`."""
+    t = float(time_limit_s)
+    if human_factor is None and math.isfinite(t) and t > 0:
+        human_factor = max(t, float(env_config()["task"]["human_limit_s"])) / t
+    h = float(human_factor) if human_factor is not None else math.nan
     if not (math.isfinite(t) and t > 0 and math.isfinite(h) and h >= 1):
         raise ValueError("time_limit_s must be > 0 and human_factor >= 1")
     cfg = cell_config()

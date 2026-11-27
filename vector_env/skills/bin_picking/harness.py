@@ -893,10 +893,9 @@ def compare(results_a: list[dict], results_b: list[dict]) -> dict:
 
 ROW_BYTES = 8 * CTRL
 CLAIM_PICK_KEYS = ("pick", "target", "target_class", "outcome", "t", "tick", "outs", "out_parts", "tcp_path_m",
-                   "joint_path_rad", "crate_hits", "score", "expert_s")
-CLAIM_KEYS = ("scene_id", "outcome", "success", "error", "infra", "ctrl", "n", "act_rows", "dropped_ctrl",
-              "action_hash", "rows_sent", "t", "tick", "outs", "out_parts", "tcp_path_m", "joint_path_rad", "crate_hits",
-              "target_class", "score", "expert_s", "wall_s")
+                   "joint_path_rad", "crate_hits", "score", "expert_s", "action_hash", "rows_sent")
+CLAIM_KEYS = ("scene_id", "outcome", "success", "error", "infra", "action_hash", "rows_sent", "t", "tick", "outs",
+              "out_parts", "tcp_path_m", "joint_path_rad", "crate_hits", "target_class", "score", "expert_s", "wall_s")
 CLAIM_PICK_TOTALS = ("picks_planned", "successes")
 MAX_CLAIM_ERRORS = 20
 
@@ -929,13 +928,11 @@ def claim_task(limits: dict) -> dict:
 
 
 def wire_result(result: dict, limits: dict | None = None) -> dict:
-    """The upload form of one scene's result (JSON-ready): its claim fields only, `ctrl` / `dropped_ctrl` as base64
-    float64 rows. With `limits` (a scene message's limits), the pick and scene scores are recomputed with its score
-    settings and per-pick time limit, so the claim states the round's formula."""
+    """The upload form of one scene's result (JSON-ready): its claim fields only. It carries no rows: the proof of
+    the actions is the FNV-1a hash of the rows sent (the scene's `action_hash` and each pick's `action_hash`), which
+    a re-run of the image reproduces. With `limits` (a scene message's limits), the pick and scene scores are
+    recomputed with its score settings and per-pick time limit, so the claim states the round's formula."""
     out = {k: copy.deepcopy(result.get(k)) for k in CLAIM_KEYS}
-    out["ctrl"] = out["ctrl"] or ""
-    out["dropped_ctrl"] = out["dropped_ctrl"] or ""
-    out["act_rows"] = list(out["act_rows"] or [])
     if isinstance(result.get("picks"), list):
         out["picks"] = [{k: copy.deepcopy(p.get(k)) for k in CLAIM_PICK_KEYS} for p in result["picks"]]
         for k in CLAIM_PICK_TOTALS:
@@ -948,6 +945,10 @@ def wire_result(result: dict, limits: dict | None = None) -> dict:
     return out
 
 
+def _hex16(x) -> bool:
+    return isinstance(x, str) and len(x) == 16 and all(c in "0123456789abcdef" for c in x)
+
+
 def _int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
@@ -957,61 +958,13 @@ def _num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
-def _walk(ctrl: list, dropped: list, acts: list, ticks: list, closed: list, max_rows: int) -> tuple[list, str | None]:
-    """The rows the expert sent, rebuilt from the stepped rows (`ctrl`), the rows dropped after a verdict and the row
-    count of every act: an act's rows run in the current pick until its verdict (the rest are dropped), and an empty
-    act holds the last row until the verdict. Returns (sent rows, None) or (_, the first inconsistency)."""
-    sent: list = []
-    i = j = k = tk = 0
-    for a_i, a in enumerate(acts):
-        if k >= len(ticks):
-            return sent, f"act {a_i} comes after the last pick ended"
-        if a > max_rows - tk:
-            return sent, f"act {a_i} has {a} rows, more than the {max_rows - tk} left in pick {k}"
-        if a == 0:
-            if not closed[k]:
-                return sent, f"act {a_i} is empty (it holds until a verdict), but pick {k} has no verdict"
-            need = ticks[k] - tk
-            if need < 1 or i + need > len(ctrl):
-                return sent, f"the hold of empty act {a_i} does not fit pick {k}'s {ticks[k]} ticks"
-            hold = ctrl[i - 1] if i else ctrl[i]
-            if not i and hold[CTRL - 1] != 0:
-                return sent, f"empty act {a_i} holds the start pose, whose grip is 0, not {hold[CTRL - 1]!r}"
-            if any(ctrl[x] != hold for x in range(i, i + need)):
-                return sent, f"the rows of empty act {a_i} do not repeat the last row"
-            i, k, tk = i + need, k + 1, 0
-            continue
-        left = ticks[k] - tk if closed[k] else None
-        if left is not None and left < 1:
-            return sent, f"pick {k} has its verdict at tick {ticks[k]}, before act {a_i}"
-        take = a if left is None else min(a, left)
-        if i + take > len(ctrl):
-            return sent, f"ctrl ends inside act {a_i}"
-        sent.extend(ctrl[i:i + take])
-        i, tk = i + take, tk + take
-        if left is not None and take == left:
-            drop = a - take
-            if j + drop > len(dropped):
-                return sent, f"act {a_i} drops {drop} rows after pick {k}'s verdict, but dropped_ctrl ends first"
-            sent.extend(dropped[j:j + drop])
-            j, k, tk = j + drop, k + 1, 0
-    if i != len(ctrl):
-        return sent, f"ctrl has {len(ctrl) - i} rows that no act sent"
-    if j != len(dropped):
-        return sent, f"dropped_ctrl has {len(dropped) - j} rows that no act dropped"
-    if k < len(ticks) and (closed[k] or k != len(ticks) - 1 or tk != ticks[k]):
-        return sent, f"the acts end at tick {tk} of pick {k}, which ends at tick {ticks[k]}"
-    return sent, None
-
-
 def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
     """The cheap check of a scene's claimed result (its `wire_result` form), without simulation: [] = accepted, else
     what is wrong. `limits` = the scene message's limits ({time_limit_s, picks, max_rows, tick_s, control_hz}
-    [+ score settings `score`, row bound `max_abs`]). Checks: the scene id; rows decode, are finite, within
-    ±max_abs and within picks × max_rows; the act row counts rebuild the stepped rows and the rows sent, whose FNV-1a
-    hash is `action_hash`; every pick's fields (index, target, ticks, time, metrics, score); the scene totals; and
-    `score` = rules.score of the picks with the limits' settings."""
-    import math
+    [+ score settings `score`]). Checks: the scene id; the action hashes are FNV-1a hex digests and the row counts
+    fit picks × max_rows (each pick's within max_rows, their sum = rows_sent); every pick's fields (index, target,
+    ticks, time, metrics, score); the scene totals; and `score` = rules.score of the picks with the limits'
+    settings. Whether the hashes are the image's own actions is checked by re-running it (phase 2)."""
     errs: list[str] = []
 
     def bad(msg: str) -> list[str]:
@@ -1026,7 +979,6 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
         P = int(limits.get("picks") or 1)
     except (KeyError, TypeError, ValueError) as e:
         return [f"the limits are not usable ({type(e).__name__}: {e}); they need time_limit_s, max_rows, tick_s, picks"]
-    max_abs = float(limits.get("max_abs") or (env_config()["harness"].get("remote") or {}).get("max_abs", 100.0))
     multi = rules.scene_mode(scene) == "pile"
     if multi and P != rules.scene_picks(scene):
         bad(f"the limits say {P} picks, the scene {rules.scene_picks(scene)}")
@@ -1035,39 +987,24 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
     o = result.get("outcome")
     harness_end = o in HARNESS_OUTCOMES
     if multi:
-        if o not in (rules.SCENE_DONE, *HARNESS_OUTCOMES):
-            return bad(f"outcome {o!r} is not {rules.SCENE_DONE!r} or a harness outcome")
+        if o not in (rules.SCENE_DONE, rules.PHYSICS_ERROR, *HARNESS_OUTCOMES):
+            return bad(f"outcome {o!r} is not {rules.SCENE_DONE!r}, {rules.PHYSICS_ERROR!r} or a harness outcome")
+        if o == rules.PHYSICS_ERROR and not (isinstance(result.get("picks"), list) and result["picks"]
+                                             and (result["picks"][-1] or {}).get("outcome") == rules.PHYSICS_ERROR):
+            bad(f"a {rules.PHYSICS_ERROR} scene ends with a {rules.PHYSICS_ERROR} pick")
     elif o not in (*rules.OUTCOMES, *HARNESS_OUTCOMES):
         return bad(f"outcome {o!r} is not an outcome")
 
-    rows = {}
-    for key, cnt in (("ctrl", "n"), ("dropped_ctrl", None)):
-        try:
-            rows[key] = decode_rows(result.get(key) or "")
-        except ValueError as e:
-            return bad(f"{key}: {e}")
-        if cnt and (not _int(result.get(cnt)) or result[cnt] != len(rows[key])):
-            bad(f"{cnt} = {result.get(cnt)!r}, but ctrl holds {len(rows[key])} rows")
-        for r_i, r in enumerate(rows[key]):
-            for x in r:
-                if not math.isfinite(x) or abs(x) > max_abs:
-                    bad(f"{key} row {r_i} has {x!r}: every value must be finite and within ±{max_abs:g}")
-                    break
-            if len(errs) >= MAX_CLAIM_ERRORS:
-                return errs
-    ctrl, dropped = rows["ctrl"], rows["dropped_ctrl"]
-    acts = result.get("act_rows")
-    if not isinstance(acts, list) or not all(_int(a) and a >= 0 for a in acts):
-        return bad("act_rows must be a list of row counts (integers >= 0)")
     sent_n = result.get("rows_sent")
-    if not _int(sent_n) or sent_n != sum(acts):
-        bad(f"rows_sent = {sent_n!r}, but the acts hold {sum(acts)} rows")
-    if len(ctrl) > P * max_rows or sum(acts) > P * max_rows:
-        bad(f"{len(ctrl)} rows stepped and {sum(acts)} sent: at most {P} picks × {max_rows} rows")
+    if not _int(sent_n) or not 0 <= sent_n <= P * max_rows:
+        bad(f"rows_sent = {sent_n!r} is not a row count within {P} picks × {max_rows} rows")
+        sent_n = 0
+    if not (result.get("action_hash") is None and harness_end and not sent_n) and not _hex16(result.get("action_hash")):
+        bad(f"action_hash {result.get('action_hash')!r} is not an FNV-1a hex digest (16 lowercase hex digits)")
 
     picks = result.get("picks")
     if multi:
-        if picks is None and harness_end and not ctrl and not acts:
+        if picks is None and harness_end and not sent_n:
             picks = []
         if not isinstance(picks, list):
             return bad("picks must be a list (a pile scene)")
@@ -1080,7 +1017,7 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
     else:
         if picks is not None:
             bad("a scene of one try has no picks list")
-        picks = [{"pick": 0, "target": scene.get("target"), "outcome": o, "tick": result.get("tick", len(ctrl)),
+        picks = [{"pick": 0, "target": scene.get("target"), "outcome": o, "tick": result.get("tick"),
                   "t": result.get("t")}]
     verdicts = (*rules.PILE_OUTCOMES, "physics_error") if multi else rules.OUTCOMES
     parts = len((scene.get("meta") or {}).get("parts") or []) or None
@@ -1118,6 +1055,9 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
             bad(f"pick 0 target {tg!r} is not the scene's target {scene.get('target')!r}")
         if not multi:
             continue
+        if not _hex16(p.get("action_hash")) or not _int(p.get("rows_sent")) or not 0 <= p["rows_sent"] <= max_rows:
+            bad(f"pick {k} action_hash {p.get('action_hash')!r} / rows_sent {p.get('rows_sent')!r} are not an FNV-1a "
+                f"hex digest and a row count within {max_rows}")
         if k == 0 and scene.get("target_class") is not None and p.get("target_class") != scene["target_class"]:
             bad(f"pick 0 target_class {p.get('target_class')!r} is not the scene's {scene['target_class']!r}")
         if p.get("target_class") not in (None, *rules.TARGET_CLASSES):
@@ -1143,12 +1083,8 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
     if errs:
         return errs
 
-    sent, why = _walk(ctrl, dropped, acts, ticks, closed, max_rows)
-    if why:
-        return bad(f"the rows do not fit the picks: {why}")
-    h = result.get("action_hash")
-    if not (h is None and not acts and harness_end) and h != action_hash(sent):
-        bad(f"action_hash {h!r} is not the FNV-1a hash of the rows sent ({action_hash(sent)})")
+    if multi and picks and sum(int(p.get("rows_sent") or 0) for p in picks) != sent_n:
+        bad(f"rows_sent = {sent_n!r}, but the picks sent {sum(int(p.get('rows_sent') or 0) for p in picks)} rows")
 
     tick_sum = sum(ticks)
     if multi and picks:
@@ -1175,8 +1111,6 @@ def check_claim(scene: dict, result: dict, limits: dict) -> list[str]:
             outs = result.get("outs")
             if not _int(outs) or outs < 0:
                 bad(f"outs = {outs!r} is not a count")
-    if len(ctrl) != tick_sum:
-        bad(f"ctrl holds {len(ctrl)} rows, but the picks run {tick_sum} ticks")
     if not _num(result.get("t")) or abs(float(result["t"]) - tick_sum * tick_s) > 1e-5:
         bad(f"t = {result.get('t')!r}, but {tick_sum} ticks are {round(tick_sum * tick_s, 6)} s")
     if result.get("expert_s") is not None and (not _num(result["expert_s"]) or result["expert_s"] < 0):
