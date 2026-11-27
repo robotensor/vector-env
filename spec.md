@@ -150,12 +150,17 @@ cd js && npm test
 
 ## 8. Rounds
 
-What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim (round 1 of
-`bin-picking-expert`: `bin-picking-expert-r1`). The example's `ARG VECTOR_SIM_REF=` names such a tag. No
-`v<number>` tag is used as a pin.
+What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim (round 2 of
+`bin-picking-expert`: `bin-picking-expert-r2`). The example's `ARG VECTOR_SIM_REF=` names such a tag. No `v<number>`
+tag is used as a pin. Round 1 was `bin-picking-expert-r1` of vector-miner; it installed vector-env and vector-sim at
+`v0.1.0`.
 
 ## 9. Behaviour
 
 The restructure changes no result: the same seed gives byte-identical scenes (`scene_id`, `xml`, `meta`,
 `checkpoint`, `state_hash`, `target`), the same rows give the same action hashes, outcomes and verifier results,
 and every command prints the same output with the same exit code.
+
+0.2.0 changes pile scenes only: a pile that fills more than 0.667 + 0.02 of the crate depth is refused (the next seed
+is tried), and a bury whose last try fails is undone (`meta.fill.bury.undo_failed`). Earlier scenes, scenes of other
+modes and pile scenes whose bury succeeded keep their state hashes and replay bit-equal.

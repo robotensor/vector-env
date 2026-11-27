@@ -32,10 +32,13 @@ These names and their behaviour are unchanged (old and new import paths, see the
   `prepare`, `scene_file`, `stderr_path`, `check_replay`, `CTRL`, `EMPTY_ACTION_HASH`, `HarnessError`,
   `DockerUnavailable`, `ImageMissing`, `PullFailed`, `ImageTooLarge`, `ReplayMismatch`, `ChannelClosed`,
   `Reconnected`; added for claims: `check_claim`, `wire_result`, `claim_task`, `encode_rows`, `decode_rows`,
-  `CLAIM_KEYS`, `CLAIM_PICK_KEYS`. Every result gains `act_rows`, `dropped_ctrl` and `expert_s` (pile picks too).
+  `CLAIM_KEYS`, `CLAIM_PICK_KEYS`. Every result gains `act_rows`, `dropped_ctrl` and `expert_s` (pile picks too);
+  a pile pick also has `action_hash` and `rows_sent` (the rows the expert sent while it was current). A claim
+  (`wire_result`) has no `ctrl`, `n`, `act_rows` or `dropped_ctrl`: its proof of the actions is the hashes.
 - `rules`: `OUTCOMES`, `EXPERT_OUTCOMES`, `INFRA_OUTCOMES`, `HARNESS_OUTCOMES`, `defaults`, `task`; added for pile
   scenes: `PILE_OUTCOMES` (`multi_pick` in place of `wrong_part`), `TARGET_CLASSES`, `METRICS`, `SCENE_DONE` (`done`), `scene_mode`, `scene_picks`,
-  `defaults(mode)`, `score_settings`, `score`, `pick_score`; `INFRA_OUTCOMES` gains `physics_error`.
+  `defaults(mode)`, `score_settings`, `score`, `pick_score`, `PHYSICS_ERROR` (`physics_error`: a counted scene outcome, not
+  infra; that pick scores 0, the earlier picks count).
 - `assets`: `find`, `ensure`, `bundle_dir`, `cache_root`, `info`, `pull`, `pack`, `write_manifest`, `resolve`,
   `ensure_pin`, `check_pin`, `pin_dir`, `for_scene`, `MISSING`,
   `AssetsError`, `ROOT`, `FORMAT`; logger name `vector_env.assets`.
@@ -76,13 +79,21 @@ Module-level names that callers patch stay module-level and are read at call tim
 - `policy` has no format constant. The policy call is `POST <url>/v1/act` with the body of section 6.
 - In `compose` the parts a random group draws from are `candidates`; in `build/units.py` the process set is
   `workers`.
+- `rules.task(time_limit_s, human_factor=None)`: without `human_factor` the human limit is env.yaml
+  `task.human_limit_s` (20 s), at least `time_limit_s`; env.yaml has no `task.human_factor`.
+- `scenes.generate` refuses a pile scene whose fill level is outside `rain.level_range` ± `rain.level_tol`
+  (0.5–0.667 ± 0.02 of the crate depth), as it refuses one outside `rain.count_range` (50–150 parts); `draw_index`
+  and `draw_scene` then try the next seed.
+- Pile scenes carry `meta.fill.bury.undo_failed: true` (config.yaml `rain.bury.undo_failed`): when the bury's last
+  try fails, the fill goes back to the pile the rain left (the bury parts stay out of the bin). Scenes without the key
+  fill as before.
 
 ## 5. Example expert
 
 - `skills/bin-picking/example/package.json`: `"@vector/sim": "file:../../../../vector-sim/js"` (vector-sim beside
   this checkout); `package-lock.json` regenerated.
 - `Dockerfile`: `ARG VECTOR_SIM_GIT=https://github.com/robotensor/vector-sim`, `ARG
-  VECTOR_SIM_REF=bin-picking-expert-r1`; fetches vector-sim at the ref into `/vector-sim` and runs `npm ci` in its
+  VECTOR_SIM_REF=bin-picking-expert-r2`; fetches vector-sim at the ref into `/vector-sim` and runs `npm ci` in its
   `js/`; `WORKDIR /x/skills/bin-picking/example`; copies `package.json`, `package-lock.json` and `*.mjs`; `npm ci
   --omit=dev`; `ENV VECTOR_SIM_BUNDLE=/bundle HOME=/tmp`; `USER 65534:65534`; `ENTRYPOINT ["node", "solve.mjs"]`.
 - `solve.mjs` sends the same rows for the same messages; it also runs the `vector-expert/3` loop (on each `pick`

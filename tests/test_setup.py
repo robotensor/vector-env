@@ -62,7 +62,7 @@ def _setup(repo: Path, env: dict) -> subprocess.CompletedProcess:
 def test_setup_clones_vector_sim_at_the_dockerfile_tag(tmp_path):
     repo = _repo(tmp_path)
     pin = _pin(DOCKERFILE)
-    assert pin == "bin-picking-expert-r1"
+    assert pin == "bin-picking-expert-r2"
     env, log = _env(tmp_path)
     p = _setup(repo, env)
     calls = log.read_text().splitlines()

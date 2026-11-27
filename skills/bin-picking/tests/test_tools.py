@@ -11,7 +11,7 @@ from conftest import HERE, fake, needs_bundle
 from vector_env import cli, harness, scenes
 from vector_env.compose import SceneError
 
-ENV = {"version": "0.1.0", "assets_version": "2026.11.1", "assets_sha256": "e" * 64}
+ENV = {"version": "0.2.0", "assets_version": "2026.11.1", "assets_sha256": "e" * 64}
 
 
 def fake_scene(seed: int, env: dict | None = None) -> dict:
@@ -24,11 +24,11 @@ def test_scene_cache_is_keyed_by_env_assets_seed_index_and_draw(tmp_path):
     seed0 = scenes.seed_for(3, 1)
     assert c.get(3, 1) is None
     assert c.put(3, 1, fake_scene(seed0 + 2), None)
-    assert c.path(3, 1) == tmp_path / "0.1.0" / ("e" * 64) / scenes.draw_key(None) / "3" / "1.json"
+    assert c.path(3, 1) == tmp_path / "0.2.0" / ("e" * 64) / scenes.draw_key(None) / "3" / "1.json"
     sc, err = c.get(3, 1)
     assert err is None and sc["seed"] == seed0 + 2
     assert c.get(3, 2) is None and c.get(4, 1) is None
-    assert scenes.SceneCache(tmp_path, {**ENV, "version": "0.2.0"}).get(3, 1) is None
+    assert scenes.SceneCache(tmp_path, {**ENV, "version": "0.3.0"}).get(3, 1) is None
     assert scenes.SceneCache(tmp_path, {**ENV, "assets_sha256": "f" * 64}).get(3, 1) is None
     assert scenes.SceneCache(tmp_path, ENV, {"count": [2, 2]}).get(3, 1) is None
     assert scenes.draw_key({"count": [2, 2]}) != scenes.draw_key(None) == scenes.draw_key(scenes.default_draw())

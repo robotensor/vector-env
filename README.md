@@ -100,8 +100,8 @@ through either name patches both. `vector_env/env.yaml` is a link to that skill'
 
 ## Rounds
 
-What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim. Round 1 of
-`bin-picking-expert` is `bin-picking-expert-r1`. Each example's `ARG VECTOR_SIM_REF=` names such a tag.
+What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim. Round 2 of
+`bin-picking-expert` is `bin-picking-expert-r2`. Each example's `ARG VECTOR_SIM_REF=` names such a tag. Round 1 was `bin-picking-expert-r1` of vector-miner; it installed vector-env and vector-sim at `v0.1.0`.
 
 ## Tests
 

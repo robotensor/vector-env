@@ -53,7 +53,7 @@ starts at once.
 .venv/bin/vector-env run --image ghcr.io/<you>/bin-expert:dev --scenes 30 --seed 1 --workers 4
 ```
 
-The Dockerfile fetches vector-sim at `VECTOR_SIM_REF`, by default the round tag `bin-picking-expert-r1`: the
+The Dockerfile fetches vector-sim at `VECTOR_SIM_REF`, by default the round tag `bin-picking-expert-r2`: the
 simulator the harness runs in that round and the `@vector/sim` of `package-lock.json`. What miners run for a round
 is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim, so keep the default of the round you
 play; for another round build with `--build-arg VECTOR_SIM_REF=<leaf-id>-r<n>` (a tag, a branch or a full commit
