@@ -113,6 +113,12 @@ def test_pile_compose():
     assert bool(bury) == bool(st.get("bury"))
     assert len(M["parts"]) == sum(st["parts"].values()) == len(M["fill"]["spawns"]) + len(bury)
     assert sorted([s["part"] for s in M["fill"]["spawns"]] + bury) == list(range(len(M["parts"])))
+    B = compose({**st, "bury": True}, 4)["meta"]["fill"]["bury"]
+    from vector_env.skills.bin_picking.settings import cell_config
+    R = cell_config()["rain"]["bury"]
+    assert len(B["parts"]) == min(R["parts"], len(M["parts"]) // 4) and len(B["quats"]) == len(B["parts"])
+    assert B["ring_n"] == min(R["ring_n"], len(B["parts"]) - 1) and B["cap"] == R["cap"] and B["ring"] == R["ring"]
+    assert M["config"]["rules"]["target"]["hidden_max_depth"] == 2
     b = [s["batch"] for s in M["fill"]["spawns"]]
     assert b[0] == 0 and all(0 <= y - x <= 1 for x, y in zip(b, b[1:]))
     with pytest.raises(SceneError, match="level"):

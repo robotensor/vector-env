@@ -557,8 +557,9 @@ def _rain(m, st, crate, part_rows, instances, parts, cfg, seed) -> dict:
     """Rain schedule: the parts in a random order, split into batches; each batch a set of drop points over the crate
     floor whose bounding circles do not overlap, each part in a random orientation. The sim drops a batch once the pile
     is calm and stops when the pile surface reaches `level` of the crate depth. With `bury`, the largest parts stay out of the rain: once it stops,
-    the sim drops them as one tight batch over a `top` part near the centre so it ends under one layer (a `hidden`
-    target), checked with classify and retried from a snapshot."""
+    the sim lays them over a `top` part near the centre (one on it, `ring_n` on a tight ring around it, the rest as a
+    second layer on top) so it ends under one or two layers (a `hidden` target), checked with classify and retried
+    from a snapshot."""
     R = cfg["rain"]
     rng = np.random.default_rng([int(seed), 0x7A17])
     order = rng.permutation(len(instances))
@@ -577,6 +578,10 @@ def _rain(m, st, crate, part_rows, instances, parts, cfg, seed) -> dict:
         mujoco.mju_mat2Quat(q0, Rw.reshape(-1))
         bury = {"parts": [int(i) for i in big], "quats": [[float(v) for v in q0]] + [_rand_quat(brng) for _ in big[1:]], "ring": float(B["ring"]), "size": float(B["size"]),
                 "wall": reach + float(B["wall"]), "tries": int(B["tries"]), "salt": int(brng.integers(1 << 30))}
+        if B.get("ring_n") is not None:
+            bury["ring_n"] = max(0, min(len(big) - 1, int(B["ring_n"])))
+        if B.get("cap") is not None:
+            bury["cap"] = float(B["cap"])
     ix, iy = crate["inner_half"]
     cp = st["crate_pose"]
     yaw = math.radians(cp["yaw_deg"])

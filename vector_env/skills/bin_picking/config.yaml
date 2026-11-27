@@ -58,7 +58,7 @@ rain:
   settle_max_ticks: 200
   rest_speed: 0.01
   rest_ticks: 6
-  bury: {parts: 5, ring: 1.0, size: 0.8, wall: 0.005, tries: 12}
+  bury: {parts: 12, ring_n: 7, cap: 0.5, ring: 0.75, size: 0.8, wall: 0.005, tries: 12}
   limits: {parts_total: [1, 150], per_type: [0, 150]}
   physics: {timestep: 0.002, solver: pgs, iterations: 30, noslip_iterations: 3, sleep: true, sleep_tolerance: 0.015}
 
@@ -125,6 +125,7 @@ rules:
     hidden_vis: 0.05
     hidden_cam_share: 0.15
     press_dz: 0.005
+    hidden_max_depth: 2
 
 camera:
   width: 224
