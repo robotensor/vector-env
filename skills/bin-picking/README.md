@@ -386,8 +386,9 @@ f_path = 1 - path_weight * min(1, tcp_path_m / path_ref_m)
 score  = s * f_time * f_path - out_unit * (2 ** min(outs, 30) - 1)
 ```
 
-The settings are env.yaml `score:` (`rules.task(...)["score"]`); a submission's score is the mean over its counted
-scenes and can be negative. `harness.summary()` adds `counted`, `mean_score`, `picks`, `pick_successes`,
+This is the formula of a scene of one try. The settings are env.yaml `score:` (`rules.task(...)["score"]`).
+`harness.summary()` adds `counted`, `mean_score` (`rules.total`: the sum of all pick scores over the planned picks of
+the counted scenes, a scene of one try being one pick; it can be negative), `picks`, `pick_successes`,
 `pick_outcomes`, `success_rate` (successful picks over planned picks), `mean_t_s` and `outs`.
 
 A pile scene is `rules.scene_picks(scene)` picks in the same bin (env.yaml `task.pile.picks`, 10), each with its own
@@ -395,15 +396,23 @@ time limit (`task.pile.time_limit_s`, 15 s). Its result has `outcome` `done` (th
 or the harness outcome that stopped it, `picks` (one entry per pick: `pick`, `target`, `target_class`, `outcome`,
 `t`, `tick`, `outs`, `out_parts`, `tcp_path_m`, `joint_path_rad`, `crate_hits`, `score`), the totals
 `picks_planned`, `successes`, `outs`, `out_parts`, `tcp_path_m`, `joint_path_rad`, `crate_hits`, and `t`, `tick`,
-`n`, `ctrl` over the whole scene. `success` means every planned pick succeeded. Its score:
+`n`, `ctrl` over the whole scene. `success` means every planned pick succeeded. Each pick has its own score
+(`rules.pick_score`), with `t` the pick's robot time:
 
 ```
-score = (sum over picks of s_i * f_time_i * f_path_i - out_unit * (2 ** min(outs, 30) - 1)) / picks_planned
+pick score = -1                                        a part left the bin during the pick (outs > 0), whatever else happened
+           = (1 - time_weight * min(1, t / time_limit_s))
+             * (1 - path_weight * min(1, tcp_path_m / path_ref_m))
+                                                       else, the target was picked
+           = 0                                         else
+scene score = (sum of its pick scores) / picks_planned
 ```
 
-with `t_i` the pick's robot time and `outs` the scene's total: 1.0 is every pick at once, one out costs as much as
-one lost pick. A pick stopped by the harness, and picks that never ran, give 0. `physics_error` (the simulation
-diverged) ends the scene: that pick gives 0, the picks before it count, and the scene counts like any other.
+With the defaults (time_weight 0.5, path_weight 0) a picked target scores 1.0 at once down to 0.5 at the time limit.
+The -1 is `out_unit` (1.0). A planned pick that never ran scores 0. A submission's score is the sum of all pick scores
+over all planned picks of its counted scenes (`rules.total`): 100 scenes of 10 picks are 1,000 picks. A pick stopped
+by the harness scores 0, or -1 with an out. `physics_error` (the simulation diverged) ends the scene: that pick
+scores 0 (-1 with an out), the picks before it count, and the scene counts like any other.
 
 A result whose expert process exited also has `exit_code` (the process's exit code, or the signal name).
 `infra: true` results say nothing about the expert: re-run them rather than score them. Only signals the expert

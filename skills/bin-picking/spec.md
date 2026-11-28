@@ -37,8 +37,10 @@ These names and their behaviour are unchanged (old and new import paths, see the
   (`wire_result`) has no `ctrl`, `n`, `act_rows` or `dropped_ctrl`: its proof of the actions is the hashes.
 - `rules`: `OUTCOMES`, `EXPERT_OUTCOMES`, `INFRA_OUTCOMES`, `HARNESS_OUTCOMES`, `defaults`, `task`; added for pile
   scenes: `PILE_OUTCOMES` (`multi_pick` in place of `wrong_part`), `TARGET_CLASSES`, `METRICS`, `SCENE_DONE` (`done`), `scene_mode`, `scene_picks`,
-  `defaults(mode)`, `score_settings`, `score`, `pick_score`, `PHYSICS_ERROR` (`physics_error`: a counted scene outcome, not
-  infra; that pick scores 0, the earlier picks count).
+  `defaults(mode)`, `score_settings`, `score`, `pick_score` (a pick with an out -1, a picked target 1 - 0.5 x
+  min(1, t / limit), else 0), `picks_of`, `total` (the sum of all pick scores over the planned picks),
+  `PHYSICS_ERROR` (`physics_error`: a counted scene outcome, not infra; that pick scores 0, -1 with an out, the
+  earlier picks count).
 - `assets`: `find`, `ensure`, `bundle_dir`, `cache_root`, `info`, `pull`, `pack`, `write_manifest`, `resolve`,
   `ensure_pin`, `check_pin`, `pin_dir`, `for_scene`, `MISSING`,
   `AssetsError`, `ROOT`, `FORMAT`; logger name `vector_env.assets`.

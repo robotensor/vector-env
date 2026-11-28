@@ -75,7 +75,10 @@ def task(time_limit_s: float = 15.0, human_factor: float | None = None, score: d
 
 
 def pick_score(pick: dict, S: dict, lim: float) -> float:
-    """One pick's s * f_time * f_path (no outs penalty)."""
+    """One pick's score (pile scenes): -out_unit (-1) when a part left the bin during the pick (`outs` > 0), whatever
+    else happened; else f_time * f_path when the target was picked; else 0."""
+    if int(pick.get("outs") or 0) > 0:
+        return round(-S["out_unit"], 6)
     if pick.get("outcome") != "success":
         return 0.0
     t = max(0.0, float(pick.get("t") or 0.0))
@@ -83,8 +86,17 @@ def pick_score(pick: dict, S: dict, lim: float) -> float:
     return round((1 - S["time_weight"] * min(1.0, t / lim)) * (1 - S["path_weight"] * min(1.0, path / S["path_ref_m"])), 6)
 
 
+def picks_of(result: dict) -> int:
+    """The planned picks a result stands for: `picks_planned` of a multi-pick result, else 1."""
+    if isinstance(result.get("picks"), list):
+        return max(1, int(result.get("picks_planned") or len(result["picks"]) or 1))
+    return 1
+
+
 def score(result: dict, task: dict | None = None) -> float | None:
     """The score of one scene's result (None when the scene does not count: an infra outcome).
+
+    A scene of one try (classic scenes):
 
         s      = 1 if success else 0
         f_time = 1 - time_weight * min(1, t / time_limit_s)
@@ -92,8 +104,13 @@ def score(result: dict, task: dict | None = None) -> float | None:
         pen    = out_unit * (2 ** min(outs, 30) - 1)
         score  = s * f_time * f_path - pen
 
-    A multi-pick scene (`result["picks"]`, pile scenes): `(sum over picks of s_i * f_time_i * f_path_i - pen) / P`,
-    with `outs` the scene's total and P = `picks_planned`; `time_limit_s` is then the limit of one pick.
+    A multi-pick scene (`result["picks"]`, pile scenes): `sum over picks of pick_score / P`, P = `picks_planned`
+    (a planned pick that never ran scores 0); `time_limit_s` is then the limit of one pick:
+
+        pick_score = -out_unit                  if a part left the bin during the pick (outs > 0)
+                   = f_time * f_path            else, if the target was picked
+                   = 0                          else
+
     `task` is `task(...)` (its `time_limit_s` and `score` settings); without one, the env.yaml defaults."""
     o = result.get("outcome")
     if o in INFRA_OUTCOMES or result.get("infra"):
@@ -101,13 +118,10 @@ def score(result: dict, task: dict | None = None) -> float | None:
     T = task or {}
     S = score_settings(T.get("score"))
     lim = float(T.get("time_limit_s") or defaults()["time_limit_s"])
+    if isinstance(result.get("picks"), list):
+        return round(sum(pick_score(p, S, lim) for p in result["picks"]) / picks_of(result), 6)
     outs = int(result.get("outs") or 0)
     pen = S["out_unit"] * (2 ** min(max(outs, 0), MAX_OUTS) - 1)
-    if isinstance(result.get("picks"), list):
-        # several picks: (sum of the pick scores - the penalty of the scene's outs) / the planned picks
-        P = max(1, int(result.get("picks_planned") or len(result["picks"]) or 1))
-        tot = sum(pick_score(p, S, lim) for p in result["picks"])
-        return round((tot - pen) / P, 6)
     if o != "success":
         return round(0.0 - pen, 6)
     t = max(0.0, float(result.get("t") or 0.0))
@@ -115,3 +129,17 @@ def score(result: dict, task: dict | None = None) -> float | None:
     f_time = 1 - S["time_weight"] * min(1.0, t / lim)
     f_path = 1 - S["path_weight"] * min(1.0, path / S["path_ref_m"])
     return round(f_time * f_path - pen, 6)
+
+
+def total(results: list[dict], task: dict | None = None) -> float | None:
+    """A submission's score over its counted results: the sum of all pick scores over the planned picks
+    (sum of score * P over the sum of P; a scene of one try is one pick). None when no result counts."""
+    num, den = 0.0, 0
+    for r in results:
+        sc = r["score"] if "score" in r else score(r, task)
+        if sc is None:
+            continue
+        P = picks_of(r)
+        num += float(sc) * P
+        den += P
+    return round(num / den, 6) if den else None

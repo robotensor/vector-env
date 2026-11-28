@@ -279,12 +279,41 @@ def test_multi_pick_score():
     picks = [{"outcome": "success", "t": 15.0, "outs": 0}, {"outcome": "missed", "t": 30.0, "outs": 1}] + \
         [{"outcome": "success", "t": 0.0, "outs": 0}] * 8
     r = {"outcome": "done", "picks": picks, "picks_planned": 10, "outs": 1}
-    assert rules.score(r, t) == round((0.75 + 8 - 1) / 10, 6)
+    # a pick with an out scores -1, a picked target 1 - 0.5 * min(1, t / T), any other pick 0
+    assert rules.score(r, t) == round((0.75 - 1 + 8) / 10, 6)
     assert rules.score({**r, "outs": 0, "picks": [{"outcome": "success", "t": 0.0}] * 10}, t) == 1.0
-    assert rules.score({**r, "outs": 2, "picks": picks[:3]}, t) == round((0.75 + 1 - 3) / 10, 6)
+    # the picks that ran; the planned picks that never ran score 0
+    assert rules.score({**r, "outs": 1, "picks": picks[:3]}, t) == round((0.75 - 1 + 1) / 10, 6)
+    # an out costs -1 whatever else happened in that pick, and only once however many parts left the bin
+    S = rules.score_settings()
+    assert rules.pick_score({"outcome": "success", "t": 0.0, "outs": 1}, S, 30) == -1.0
+    assert rules.pick_score({"outcome": "knocked_out", "t": 30.0, "outs": 7}, S, 30) == -1.0
+    assert rules.pick_score({"outcome": "wall_timeout", "t": 3.0, "outs": 2}, S, 30) == -1.0
+    assert rules.pick_score({"outcome": "missed", "t": 30.0, "outs": 0}, S, 30) == 0.0
+    assert rules.pick_score({"outcome": "success", "t": 45.0, "outs": 0}, S, 30) == 0.5
+    many = {"outcome": "done", "picks_planned": 10, "picks": [{"outcome": "knocked_out", "t": 1.0, "outs": 30}] * 10}
+    assert rules.score(many, t) == -1.0
+    assert rules.score({**r, "picks": picks, "picks_planned": 10}, rules.task(30, score={"out_unit": 2.0})) == \
+        round((0.75 - 2 + 8) / 10, 6)
     assert rules.score({"outcome": "physics_error", "picks": [], "picks_planned": 10}, t) == 0.0
     assert rules.score({"outcome": "physics_error", "outs": 0, "picks_planned": 10,
                         "picks": [{"outcome": "success", "t": 0.0}, {"outcome": "physics_error", "t": 3.0}]}, t) == 0.1
+
+
+def test_total_is_the_sum_of_pick_scores_over_the_planned_picks():
+    t = rules.task(30)
+    a = {"outcome": "done", "picks_planned": 10, "picks": [{"outcome": "success", "t": 0.0, "outs": 0}] * 10}
+    b = {"outcome": "done", "picks_planned": 10, "picks": [{"outcome": "success", "t": 0.0, "outs": 0},
+                                                         {"outcome": "missed", "t": 30.0, "outs": 2}]}
+    c = {"outcome": "harness_error", "infra": True, "picks": [], "picks_planned": 10}
+    for x in (a, b, c):
+        x["score"] = rules.score(x, t)
+    assert (a["score"], b["score"], c["score"]) == (1.0, 0.0, None)
+    # (10 + 1 - 1) / 20 planned picks; the infra scene does not count
+    assert rules.total([a, b, c]) == 0.5
+    assert rules.total([c]) is None
+    s = harness.summary([a, b, c])
+    assert (s["counted"], s["picks"], s["mean_score"]) == (2, 20, 0.5), s
 
 
 def _limits(scene, time_limit_s, **kw):

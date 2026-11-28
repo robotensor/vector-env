@@ -460,8 +460,8 @@ def summary(results: list[dict]) -> dict:
     ex = [r["exchange"] for r in results if (r.get("exchange") or {}).get("n")]
     tot = sum(e["n"] for e in ex)
     counted = [r for r in results if r.get("outcome") not in INFRA_OUTCOMES and not r.get("infra")]
-    sc = [r["score"] if "score" in r else rules.score(r) for r in counted]
-    sc = [x for x in sc if x is not None]
+    # the mean score: the sum of all pick scores over the planned picks (a scene of one try is one pick)
+    mean_score = rules.total(counted)
     # picks: a multi-pick result counts its planned picks, any other result one
     planned = sum(int(r.get("picks_planned") or len(r["picks"])) if isinstance(r.get("picks"), list) else 1 for r in counted)
     picked = sum(int(r.get("successes") or 0) if isinstance(r.get("picks"), list) else int(bool(r.get("success")))
@@ -472,7 +472,7 @@ def summary(results: list[dict]) -> dict:
             pick_outcomes[p.get("outcome") or "none"] = pick_outcomes.get(p.get("outcome") or "none", 0) + 1
     return {"scenes": n, "successes": len(ok), "score": round(len(ok) / n, 4) if n else 0.0,
             "mean_time_s": round(sum(r["t"] for r in ok) / len(ok), 3) if ok else None,
-            "counted": len(counted), "mean_score": round(sum(sc) / len(sc), 6) if sc else None,
+            "counted": len(counted), "mean_score": mean_score,
             "picks": planned, "pick_successes": picked, "pick_outcomes": dict(sorted(pick_outcomes.items())),
             "success_rate": round(picked / planned, 4) if planned else None,
             "mean_t_s": round(sum(float(r.get("t") or 0) for r in counted) / len(counted), 3) if counted else None,
